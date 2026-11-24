@@ -1,5 +1,6 @@
 import os
 import socket
+import sys
 import tempfile
 import unittest
 
@@ -18,6 +19,9 @@ class NotifyTestCase(unittest.TestCase):
                 self.assertTrue(notify('READY=1', {'NOTIFY_SOCKET': path}))
                 self.assertEqual(sock.recv(100), b'READY=1')
 
+    @unittest.skipUnless(
+        sys.platform.startswith('linux'), 'abstract sockets are Linux-only'
+    )
     def test_abstract_socket(self):
         name = f'mpd-jukebox-test-{os.getpid()}'
         with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
