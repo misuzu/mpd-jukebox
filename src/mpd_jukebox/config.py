@@ -20,7 +20,7 @@ from .tags import canonical_tag
 INT_MAX = 2**31 - 1
 
 _TOP_KEYS = frozenset({'state_file', 'mpd', 'jukebox', 'albums'})
-_MPD_KEYS = frozenset({'host', 'port', 'password'})
+_MPD_KEYS = frozenset({'host', 'port', 'password', 'password_file'})
 _JUKEBOX_KEYS = frozenset(
     {
         'mode',

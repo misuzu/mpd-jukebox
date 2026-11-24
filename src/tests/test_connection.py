@@ -1,10 +1,15 @@
+import os
+import tempfile
 import unittest
+from typing import Any
 
 from mpd_jukebox.connection import (
     Connection,
     parse_mpd_host,
     parse_port,
+    read_password_file,
     resolve_connection,
+    with_password_file,
 )
 from mpd_jukebox.model import ConfigError
 
@@ -112,3 +117,43 @@ class ResolveTestCase(unittest.TestCase):
             Connection('/run/mpd.sock').describe(), '/run/mpd.sock'
         )
         self.assertTrue(Connection('@mpd').is_socket)
+
+
+class PasswordFileTestCase(unittest.TestCase):
+    def test_replaces_password_file(self):
+        result = with_password_file(
+            {'host': 'h', 'password_file': '/p'},
+            lambda path: f'secret-from-{path}\n',
+        )
+        self.assertEqual(
+            dict(result), {'host': 'h', 'password': 'secret-from-/p'}
+        )
+
+    def test_without_password_file(self):
+        config = {'host': 'h'}
+        self.assertIs(with_password_file(config, _fail), config)
+
+    def test_errors(self):
+        cases: list[dict[str, Any]] = [
+            {'password_file': ''},
+            {'password_file': 5},
+            {'password_file': '/p', 'password': 'x'},
+        ]
+        for config in cases:
+            with self.subTest(config), self.assertRaises(ConfigError):
+                with_password_file(config, lambda path: 'pw')
+        with self.assertRaises(ConfigError):
+            with_password_file({'password_file': '/p'}, lambda path: '\n')
+
+    def test_read_password_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'pw')
+            with open(path, 'w') as f:
+                f.write('secret\n')
+            self.assertEqual(read_password_file(path), 'secret\n')
+            with self.assertRaises(ConfigError):
+                read_password_file(os.path.join(tmp, 'missing'))
+
+
+def _fail(path):
+    raise AssertionError(path)

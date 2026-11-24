@@ -49,5 +49,29 @@
       packages = forAllSystems (system: {
         default = (pkgsFor system).mpd-jukebox;
       });
+
+      # The module alone expects `pkgs.mpd-jukebox`; `default` also adds the
+      # overlay that provides it.
+      nixosModules = {
+        mpd-jukebox = ./nixos/module.nix;
+        default = {
+          imports = [ inputs.self.nixosModules.mpd-jukebox ];
+          nixpkgs.overlays = [ inputs.self.overlays.default ];
+        };
+      };
+
+      # NixOS VM tests run on Linux only.
+      checks = forAllSystems (
+        system:
+        let
+          pkgs = pkgsFor system;
+        in
+        pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          nixos-module = import ./nixos/test.nix {
+            inherit pkgs;
+            module = inputs.self.nixosModules.mpd-jukebox;
+          };
+        }
+      );
     };
 }

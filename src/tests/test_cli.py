@@ -67,6 +67,42 @@ class CliTestCase(unittest.TestCase):
         self.assertEqual(result.exit_code, 1)
         self.assertIn('fuzzy', result.output)
 
+    def test_check(self):
+        path = self.config(
+            '[mpd]\nhost = "/run/mpd/socket"\n'
+            'password_file = "/nonexistent/secret"\n'
+        )
+        result = self.invoke(['--config', path, 'check'])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn('song mode, MPD at /run/mpd/socket', result.output)
+
+    def test_check_rejects_bad_config(self):
+        path = self.config('[mpd]\npassword = "a"\npassword_file = "/p"\n')
+        result = self.invoke(['--config', path, 'check'])
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn('mutually exclusive', result.output)
+
+    def test_run_reads_password_file(self):
+        secret = os.path.join(self._tmp.name, 'secret')
+        with open(secret, 'w') as f:
+            f.write('pw\n')
+        path = self.config(f'[mpd]\npassword_file = "{secret}"\n')
+        fake = FakeMPD(library(150), password='pw')
+
+        def install(runtime):
+            asyncio.get_running_loop().call_later(0.3, runtime.stop)
+
+        with mock.patch('mpd_jukebox.cli._install_signals', install):
+            result = self.invoke(['--config', path, 'run'], fake)
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(fake.commands[0], 'password')
+
+    def test_run_missing_password_file(self):
+        path = self.config('[mpd]\npassword_file = "/nonexistent"\n')
+        result = self.invoke(['--config', path, 'run'])
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn('cannot read password file', result.output)
+
     def test_list_without_state(self):
         result = self.invoke(['list'])
         self.assertEqual(result.exit_code, 1)

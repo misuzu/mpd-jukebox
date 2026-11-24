@@ -13,7 +13,12 @@ import click
 
 from . import jukebox as core
 from .config import Settings, read_config_file
-from .connection import Connection, resolve_connection
+from .connection import (
+    Connection,
+    read_password_file,
+    resolve_connection,
+    with_password_file,
+)
 from .model import ConfigError
 from .mpd_io import FatalMpdError, MpdIO
 from .runtime import (
@@ -25,6 +30,7 @@ from .runtime import (
     random_seed,
 )
 from .store import Store, StoreError, default_path, load_migrations
+from .systemd import notify
 
 log = logging.getLogger(__name__)
 
@@ -47,16 +53,17 @@ class Loaded:
     state_file: str
 
 
-def load(options: Options) -> Loaded:
+def load(options: Options, *, read_secrets: bool = True) -> Loaded:
     try:
         settings = read_config_file(options.config_path)
+        reader = read_password_file if read_secrets else (lambda path: '***')
         connection = resolve_connection(
             {
                 'host': options.host,
                 'port': options.port,
                 'password': options.password,
             },
-            settings.mpd,
+            with_password_file(settings.mpd, reader),
             os.environ,
         )
     except ConfigError as e:
@@ -139,6 +146,8 @@ async def _run(loaded: Loaded, connect: Connect) -> None:
             loaded.settings, loaded.connection, store, connect=connect
         )
         _install_signals(runtime)
+        # Only now can SIGHUP (`systemctl reload`) be handled.
+        notify('READY=1')
         await runtime.run()
     finally:
         await store.close()
@@ -153,6 +162,19 @@ def _install_signals(runtime: Runtime) -> None:
     }
     for signum, handler in handlers.items():
         loop.add_signal_handler(signum, handler)
+
+
+@main.command()
+@click.pass_obj
+def check(options: Options) -> None:
+    """Check the configuration and exit. Connects to nothing and reads no
+    password file."""
+    loaded = load(options, read_secrets=False)
+    cfg = loaded.settings.config
+    click.echo(
+        f'OK: {cfg.mode.value} mode, MPD at {loaded.connection.describe()}, '
+        f'state in {loaded.state_file}'
+    )
 
 
 @main.command('list')

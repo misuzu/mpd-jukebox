@@ -5,7 +5,7 @@ starting with `@` is an abstract socket; otherwise everything before the
 first `@` is the password.
 """
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -67,6 +67,38 @@ def _text(value: object, source: str) -> str | None:
     if not isinstance(value, str):
         raise ConfigError(f'{source} must be a string')
     return value
+
+
+def with_password_file(
+    config: Mapping[str, Any], read: Callable[[str], str]
+) -> Mapping[str, Any]:
+    """Replace `[mpd].password_file` with the `password` it contains.
+
+    `read` returns the file's contents; the shell passes a real reader, and
+    `check` passes one that returns a placeholder so no secret is read.
+    """
+    path = config.get('password_file')
+    if path is None:
+        return config
+    if not isinstance(path, str) or not path:
+        raise ConfigError('[mpd].password_file must be a non-empty string')
+    if config.get('password') is not None:
+        raise ConfigError(
+            '[mpd].password and [mpd].password_file are mutually exclusive'
+        )
+    password = read(path).rstrip('\r\n')
+    if not password:
+        raise ConfigError(f'{path}: the password file is empty')
+    rest = {k: v for k, v in config.items() if k != 'password_file'}
+    return {**rest, 'password': password}
+
+
+def read_password_file(path: str) -> str:
+    try:
+        with open(path, encoding='utf-8') as f:
+            return f.read()
+    except OSError as e:
+        raise ConfigError(f'cannot read password file: {e}') from e
 
 
 def resolve_connection(

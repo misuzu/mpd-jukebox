@@ -589,6 +589,7 @@ and `MPD_PORT` are also accepted (§5.5).
 # host = "localhost"       # hostname, IP, /path/to/socket, @abstract, or "password@host"
 # port = 6600
 # password = "secret"      # alternative to "password@host"; may contain '@'
+# password_file = "/run/credentials/mpd-jukebox.service/mpd-password"
 
 [jukebox]
 mode = "song"              # song | album
@@ -675,6 +676,11 @@ the shell passes in `os.environ` as a plain mapping).
     a different host set in the config file.
   - Setting a password both in `password@host` form and with an explicit
     `password` in the same source is a `ConfigError`.
+  - `[mpd].password_file` names a file holding the config file's password,
+    for example a systemd credential. It cannot be combined with
+    `[mpd].password`. The shell reads the file (trailing newline removed)
+    and the pure `with_password_file` puts its contents in place of the key
+    before `resolve_connection` runs.
 - **Port:** `--port`, then `[mpd].port`, then `MPD_PORT`, then 6600.
 - The config file ranks above the environment because it is specific to this
   daemon, while `MPD_HOST` is often set globally for every MPD client. CLI
@@ -698,6 +704,9 @@ on every reconnect.
 
 - `mpd-jukebox run`: the daemon.
 - `mpd-jukebox list`: print the saved jukebox queue (read-only, from SQLite).
+- `mpd-jukebox check`: validate the configuration (including the
+  connection settings) and exit. It connects to nothing and does not read
+  the password file, so it can run while the system is built.
 - `mpd-jukebox select [-n N] [--seed S]`: run one selection against the live
   MPD and print the picks without changing anything. It is always a dry run.
   It reads the play history from the state database if one exists. This is
@@ -711,6 +720,44 @@ python-mpd2 only), `--state` (the state database; also the top-level
 file is the better place for a password.
 
 ---
+
+### 5.7 systemd and NixOS (`nixos/module.nix`)
+
+`run` sends `READY=1` to `$NOTIFY_SOCKET` (`systemd.py`, no libsystemd)
+once its signal handlers are installed. The unit is `Type=notify`, so a
+`systemctl reload` (SIGHUP) sent during startup waits instead of killing the
+process with the default signal action.
+
+The NixOS module `services.mpd-jukebox`:
+
+- `settings` is the TOML config file, with typed defaults for `mpd.host`,
+  `mpd.port` (taken from `services.mpd` when it is enabled on the same
+  machine), `jukebox.mode` and `jukebox.queue_length`. Other keys pass
+  through. The generated file is checked with `mpd-jukebox check` at build
+  time and installed as `/etc/mpd-jukebox/config.toml` for running `list` by
+  hand.
+- `passwordFile` is passed in with `LoadCredential`, and the config file
+  points `[mpd].password_file` at the credential. Setting
+  `settings.mpd.password` is rejected by an assertion, because it would put
+  the password in the Nix store.
+- The service runs with `DynamicUser`, `StateDirectory=mpd-jukebox` (the state
+  database is `/var/lib/mpd-jukebox/state.sqlite`) and systemd hardening:
+  `ProtectSystem=strict`, no capabilities, only `AF_UNIX`/`AF_INET`/`AF_INET6`
+  sockets and the `@system-service` system calls. `ExecReload` sends SIGHUP. It is ordered
+  after `mpd.service` (or `mpd.socket`) when the local MPD is enabled, and it
+  restarts on failure after 10 s.
+
+The VM test (`nixos/test.nix`, flake output `checks.<system>.nixos-module`)
+runs two machines with a real MPD, a null audio output and 90 generated
+12-second tracks:
+
+- `tcp`: song mode over TCP, against an MPD that refuses everything without
+  a password. It checks playback, replacement of finished songs, the
+  history and `lastPlayed`/`playCount` stickers, `systemctl reload`, and
+  `list`. It also checks that the password appears in neither the journal
+  nor the config file.
+- `socket`: album mode over a Unix socket; whole albums are queued in track
+  order.
 
 ## 6. Testing
 
