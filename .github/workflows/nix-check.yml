@@ -1,0 +1,23 @@
+name: "nix flake check"
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  tests:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-26.04]
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v7
+
+    - name: Install Nix & Setup Cache
+      uses: DeterminateSystems/nix-installer-action@v23
+
+    - name: Run Nix Flake Check
+      run: nix flake check -L
