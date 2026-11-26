@@ -101,6 +101,9 @@ class Config:
     add_offset: int = 10
     last_played_count: int = 2000
     write_stickers: bool = False
+    # Album mode: seconds without database changes before the picks are
+    # checked, because each check rescans the whole library. Not in TOML.
+    album_check_delay: int = 30
     albums: AlbumSettings = field(default_factory=AlbumSettings)
 
 

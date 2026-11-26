@@ -134,8 +134,12 @@ class Store:
                 ],
             )
 
-    async def record_play(self, uri: str, ts: int, keep: int) -> None:
-        """Append to the history, keeping the newest `keep` rows."""
+    async def record_play(
+        self, uri: str, ts: int, *, keep: int, since: int
+    ) -> None:
+        """Append to the history. Rows are deleted only when they are both
+        beyond the newest `keep` and older than `since`, so the history
+        always covers the last-played window. `keep` 0 disables it."""
         if keep <= 0:
             return
         async with self._transaction():
@@ -143,9 +147,9 @@ class Store:
                 'INSERT INTO history (uri, ts) VALUES (?, ?)', (uri, ts)
             )
             await self._db.execute(
-                'DELETE FROM history WHERE id <= '
+                'DELETE FROM history WHERE ts < ? AND id <= '
                 '(SELECT MAX(id) FROM history) - ?',
-                (keep,),
+                (since, keep),
             )
 
     async def recent(self, limit: int) -> tuple[str, ...]:

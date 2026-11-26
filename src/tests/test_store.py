@@ -174,14 +174,24 @@ class StoreTestCase(unittest.IsolatedAsyncioTestCase):
         store = await self.open()
         await store.upgrade(load_migrations())
         for i in range(5):
-            await store.record_play(f'u{i}', 100 + i, keep=3)
+            # `since` after every play: only the count limit applies.
+            await store.record_play(f'u{i}', 100 + i, keep=3, since=1000)
         self.assertEqual(await store.recent(10), ('u4', 'u3', 'u2'))
         self.assertEqual(await store.recent(1), ('u4',))
         self.assertEqual(
             await store.history(), (('u4', 104), ('u3', 103), ('u2', 102))
         )
-        await store.record_play('ignored', 1, keep=0)
+        await store.record_play('ignored', 1, keep=0, since=0)
         self.assertEqual(len(await store.history()), 3)
+
+    async def test_history_keeps_the_last_played_window(self):
+        store = await self.open()
+        await store.upgrade(load_migrations())
+        for i in range(6):
+            # Plays at 100..105; the window starts at 102.
+            await store.record_play(f'u{i}', 100 + i, keep=2, since=102)
+        # Beyond the newest 2, but inside the window: kept.
+        self.assertEqual(await store.recent(10), ('u5', 'u4', 'u3', 'u2'))
 
     async def test_readonly(self):
         store = await self.open()

@@ -64,6 +64,7 @@ class RuntimeTestCase(unittest.IsolatedAsyncioTestCase):
         raw=None,
         connection=None,
         store=None,
+        overrides=None,
     ) -> tuple[Runtime, asyncio.Task]:
         """Run a Runtime against FakeMPD instances, one per connect."""
         queue = list(fakes) if isinstance(fakes, list) else [fakes]
@@ -75,8 +76,12 @@ class RuntimeTestCase(unittest.IsolatedAsyncioTestCase):
             fake.connected = True
             return fake
 
+        settings = parse_config(raw or {})
+        if overrides:
+            config = replace(settings.config, **overrides)
+            settings = replace(settings, config=config)
         runtime = Runtime(
-            parse_config(raw or {}),
+            settings,
             connection or Connection(),
             store or await self.store(),
             connect=connect,
@@ -125,9 +130,10 @@ class RuntimeTestCase(unittest.IsolatedAsyncioTestCase):
 
     async def test_refill_failure_halts_until_restart(self):
         fake = FakeMPD(library(5))
-        runtime, _ = await self.start(fake)
-        await wait_for(lambda: runtime.state.halted)
-        self.assertIn('found 5 of 101', runtime.state.last_error)
+        with self.assertLogs('mpd_jukebox.runtime', 'ERROR') as logs:
+            runtime, _ = await self.start(fake)
+            await wait_for(lambda: runtime.state.halted)
+        self.assertIn('found 5 of 101', '\n'.join(logs.output))
         self.assertEqual(fake.queue, [])
 
         fake.library = library(150)
@@ -228,9 +234,10 @@ class RuntimeTestCase(unittest.IsolatedAsyncioTestCase):
     async def test_adds_that_keep_failing_halt(self):
         fake = FakeMPD(library(150))
         fake.fail_add = {s['file'] for s in fake.library}
-        runtime, _ = await self.start(fake)
-        await wait_for(lambda: runtime.state.halted)
-        self.assertIn('100 times in a row', runtime.state.last_error)
+        with self.assertLogs('mpd_jukebox.runtime', 'ERROR') as logs:
+            runtime, _ = await self.start(fake)
+            await wait_for(lambda: runtime.state.halted)
+        self.assertIn('100 times in a row', '\n'.join(logs.output))
         self.assertEqual(fake.queue, [])
         self.assertEqual(fake.commands.count('add'), 100)
 
@@ -279,7 +286,9 @@ class RuntimeTestCase(unittest.IsolatedAsyncioTestCase):
     async def test_database_change_in_album_mode(self):
         fake = FakeMPD(albums(30))
         raw = {'jukebox': {'mode': 'album'}}
-        runtime, _ = await self.start(fake, raw)
+        runtime, _ = await self.start(
+            fake, raw, overrides={'album_check_delay': 0}
+        )
         await wait_for(lambda: len(runtime.state.jukebox_queue) == 25)
         await wait_for(lambda: not runtime.state.validating)
         first = runtime.state.jukebox_queue[0]
@@ -318,9 +327,10 @@ class RuntimeTestCase(unittest.IsolatedAsyncioTestCase):
                 raise error(2, 'search', 'Unknown filter type')
 
         fake = Rejecting(library(150))
-        runtime, _ = await self.start(fake)
-        await wait_for(lambda: runtime.state.halted)
-        self.assertIn('Unknown filter type', runtime.state.last_error)
+        with self.assertLogs('mpd_jukebox.runtime', 'ERROR') as logs:
+            runtime, _ = await self.start(fake)
+            await wait_for(lambda: runtime.state.halted)
+        self.assertIn('Unknown filter type', '\n'.join(logs.output))
 
     async def test_mpd_error_in_session_reconnects(self):
         class Flaky(FakeMPD):
@@ -413,6 +423,19 @@ class HandleTestCase(unittest.IsolatedAsyncioTestCase):
         runtime._drain()
         self.assertEqual(runtime._events.get_nowait(), core.Restart(2))
         self.assertTrue(runtime._events.empty())
+
+    async def test_partial_album_is_kept_with_a_warning(self):
+        runtime = self.runtime({'jukebox': {'mode': 'album'}})
+        fake = FakeMPD(albums(2))
+        io = MpdIO(fake)
+        index = await runtime.refiller.album_index(io)
+        key, album = next(iter(index.items()))
+        fake.fail_add = {album.uris[0]}
+        effect = core.Enqueue(Mode.ALBUM, (Entry(key, 1, 'Artist'),), 1)
+        with self.assertLogs('mpd_jukebox.runtime', 'WARNING') as logs:
+            self.assertEqual(await runtime._enqueue(io, effect), 1)
+        self.assertIn('without 1 of its 3 songs', '\n'.join(logs.output))
+        self.assertEqual(len(fake.queue), 2)
 
     async def test_unknown_album_is_skipped(self):
         runtime = self.runtime({'jukebox': {'mode': 'album'}})

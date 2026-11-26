@@ -192,10 +192,9 @@ class RunTestCase(unittest.TestCase):
 
 class RefillTestCase(unittest.TestCase):
     def test_done_with_add_enqueues(self):
-        state = State(filling=True, last_error='old')
+        state = State(filling=True)
         state, effects = update(CFG, state, RefillDone(entries(102), 2, NOW))
         self.assertFalse(state.filling)
-        self.assertEqual(state.last_error, '')
         self.assertEqual(state.jukebox_queue, entries(102)[2:])
         self.assertEqual(
             effects,
@@ -215,9 +214,10 @@ class RefillTestCase(unittest.TestCase):
         )
         self.assertTrue(state.halted)
         self.assertFalse(state.filling)
-        self.assertEqual(state.last_error, 'too few')
         self.assertIn(CancelTimer(core.JUKEBOX_TIMER), effects)
-        self.assertEqual(of_type(effects, Log)[0].level, logging.ERROR)
+        (log,) = of_type(effects, Log)
+        self.assertEqual(log.level, logging.ERROR)
+        self.assertIn('too few', log.message)
         # Nothing runs while halted, and the timer stays off.
         state, effects = update(CFG, state, QueueChanged(STOPPED, NOW))
         self.assertEqual(of_type(effects, StartRefill), [])
@@ -227,13 +227,11 @@ class RefillTestCase(unittest.TestCase):
     def test_restart_resumes(self):
         state = State(
             halted=True,
-            last_error='x',
             jukebox_queue=entries(5),
             status=STOPPED,
         )
         state, effects = update(CFG, state, Restart(NOW))
         self.assertFalse(state.halted)
-        self.assertEqual(state.last_error, '')
         self.assertEqual(effects[0], Persist(()))
         self.assertEqual(
             of_type(effects, StartRefill),
@@ -300,7 +298,7 @@ class EnqueuedTestCase(unittest.TestCase):
         state = State(jukebox_queue=entries(50), add_failures=8)
         state, effects = update(cfg, state, enqueued(2, 0, 2, STOPPED))
         self.assertTrue(state.halted)
-        self.assertIn('10 times in a row', state.last_error)
+        self.assertIn('10 times in a row', of_type(effects, Log)[0].message)
         self.assertEqual(of_type(effects, Enqueue), [])
         self.assertIn(CancelTimer(core.JUKEBOX_TIMER), effects)
         # A restart starts counting again.
@@ -375,6 +373,22 @@ class ValidationTestCase(unittest.TestCase):
         )
         self.assertTrue(state.validating)
         self.assertFalse(state.revalidate)
+
+    def test_album_mode_waits_for_a_quiet_database(self):
+        cfg = replace(CFG, mode=Mode.ALBUM, album_check_delay=30)
+        state = State(jukebox_queue=entries(20))
+        state, effects = update(cfg, state, DatabaseChanged(NOW))
+        self.assertEqual(effects, (SetTimer(core.VALIDATE_TIMER, 30),))
+        self.assertFalse(state.validating)
+        # Another change pushes the timer back (SetTimer replaces it).
+        _, effects = update(cfg, state, DatabaseChanged(NOW + 5))
+        self.assertEqual(effects, (SetTimer(core.VALIDATE_TIMER, 30),))
+        event = TimerFired(core.VALIDATE_TIMER, PLAYING, NOW + 35)
+        state, effects = update(cfg, state, event)
+        self.assertEqual(
+            of_type(effects, Validate), [Validate(Mode.ALBUM, entries(20))]
+        )
+        self.assertTrue(state.validating)
 
     def test_change_during_a_refill_checks_its_picks(self):
         state = State(filling=True)

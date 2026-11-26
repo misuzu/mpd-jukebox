@@ -12,6 +12,7 @@ from .model import Config, Entry, Mode, PlayState, Status
 
 JUKEBOX_TIMER = 'jukebox'
 SCROBBLE_TIMER = 'scrobble'
+VALIDATE_TIMER = 'validate'
 
 SCROBBLE_TIME_MAX = 240
 SCROBBLE_TIME_TOTAL = 480
@@ -34,7 +35,6 @@ class State:
     validating: bool = False
     revalidate: bool = False
     halted: bool = False
-    last_error: str = ''
     status: Status | None = None
 
 
@@ -319,6 +319,15 @@ def _validate(cfg: Config, state: State) -> Step:
     return state, (Validate(cfg.mode, state.jukebox_queue),)
 
 
+def _on_database_changed(cfg: Config, state: State) -> Step:
+    """Song mode checks right away. Album mode waits until the database has
+    been quiet for `album_check_delay` seconds: its check rescans the whole
+    library, and every further change pushes the timer back."""
+    if cfg.mode is Mode.ALBUM:
+        return state, (SetTimer(VALIDATE_TIMER, cfg.album_check_delay),)
+    return _validate(cfg, state)
+
+
 def _topup(cfg: Config, state: State) -> Step:
     """Refill in the background when the jukebox queue runs low."""
     if (
@@ -351,6 +360,9 @@ def _on_timer(cfg: Config, state: State, event: TimerFired) -> Step:
     if event.name == JUKEBOX_TIMER:
         state, more = run(cfg, state)
         return state, effects + more
+    if event.name == VALIDATE_TIMER:
+        state, more = _validate(cfg, state)
+        return state, effects + more
     status = event.status
     uri = status.song_uri
     if status.state is PlayState.PLAY and uri and not is_stream(uri):
@@ -360,9 +372,7 @@ def _on_timer(cfg: Config, state: State, event: TimerFired) -> Step:
 
 
 def _on_refill_done(cfg: Config, state: State, event: RefillDone) -> Step:
-    state = replace(
-        state, filling=False, last_error='', jukebox_queue=event.entries
-    )
+    state = replace(state, filling=False, jukebox_queue=event.entries)
     if event.add == 0:
         effects: tuple[Effect, ...] = (Persist(event.entries),)
     else:
@@ -375,9 +385,7 @@ def _on_refill_done(cfg: Config, state: State, event: RefillDone) -> Step:
 
 
 def _halt(state: State, error: str) -> Step:
-    state = replace(
-        state, filling=False, enqueuing=False, halted=True, last_error=error
-    )
+    state = replace(state, filling=False, enqueuing=False, halted=True)
     return state, (
         Log(
             logging.ERROR,
@@ -439,9 +447,7 @@ def _on_validated(cfg: Config, state: State, event: Validated) -> Step:
 
 
 def _on_restart(cfg: Config, state: State) -> Step:
-    state = replace(
-        state, halted=False, last_error='', add_failures=0, jukebox_queue=()
-    )
+    state = replace(state, halted=False, add_failures=0, jukebox_queue=())
     state, effects = run(cfg, state)
     return state, (Persist(()),) + effects
 
@@ -470,7 +476,7 @@ def update(cfg: Config, state: State, event: Event) -> Step:
         case Enqueued():
             return _on_enqueued(cfg, state, event)
         case DatabaseChanged():
-            return _validate(cfg, state)
+            return _on_database_changed(cfg, state)
         case Validated():
             return _on_validated(cfg, state, event)
         case Restart():

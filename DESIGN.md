@@ -300,6 +300,7 @@ Config(mode, playlist, queue_length, last_played_hours, uniq_tag, ignore_hated,
        queue_length_song, queue_length_song_min,
        queue_length_album, queue_length_album_min,
        add_max, uniq_range, add_offset, last_played_count, write_stickers,
+       album_check_delay,               # not in TOML; tests set it to 0
        albums: AlbumSettings)
 
 State(jukebox_queue: tuple[Entry, ...],
@@ -309,12 +310,13 @@ State(jukebox_queue: tuple[Entry, ...],
       validating: bool,                 # a database check is running
       revalidate: bool,                 # another check is due when it (or a refill) finishes
       halted: bool,                     # set by a failed refill (§1.7) or endless failed adds (§5.1); cleared only by Restart
-      last_error: str,
       status: Status | None)            # last status seen; scrobble data comes from it
 ```
 
 The play history is not part of `State`. It lives only in the store, and the
-shell reads it when it gathers the inputs for a refill.
+shell reads it when it gathers the inputs for a refill. Errors are not part
+of `State` either: the core reports them with `Log` effects, so they end up
+in the journal.
 
 ### 4.2 Events (inputs) and effects (outputs)
 
@@ -323,13 +325,13 @@ shell reads it when it gathers the inputs for a refill.
 Connected(status, now)
 QueueChanged(status, now)            # idle "playlist"
 PlayerChanged(status, now)           # idle "player"
-TimerFired(name: 'jukebox'|'scrobble', status, now)   # the shell fetches a fresh status
+TimerFired(name: 'jukebox'|'scrobble'|'validate', status, now)   # the shell fetches a fresh status
 RefillDone(entries: tuple[Entry, ...], add: int, now)
 RefillFailed(error: str, now)
 Enqueued(attempted, added, wanted, status, now)   # result of an Enqueue effect
 DatabaseChanged(now)                 # idle "database"
 Validated(missing: frozenset[str], now)   # result of a Validate effect
-Restart(now)                         # SIGHUP: clear `halted`, `last_error` and the jukebox queue, then run
+Restart(now)                         # SIGHUP: clear `halted`, the failure count and the jukebox queue, then run
 
 # Effects: plain data that the shell interprets
 StartRefill(mode: Mode, existing: tuple[Entry, ...], expected: int, add: int)
@@ -400,8 +402,47 @@ picks, and a different seed gives different ones.
 - In song mode, library songs are streamed window by window and never all
   held in memory. Album mode needs every song to build the album index. The
   index is cached in the shell and rebuilt by each album refill and each
-  database check (§5.1), so a database update in album mode costs a full
-  library scan in the background.
+  database check (§5.1), so a database check in album mode costs a full
+  library scan in the background. To keep bursts of updates (MPD's
+  `auto_update`) from causing a scan each, album mode checks only once the
+  database has been quiet for `album_check_delay` (30) seconds.
+
+### 4.6 Concurrency rules
+
+The core handles one event at a time, but its work is spread over events:
+a refill, an `Enqueue` and a database check each start with an effect and
+finish with a later event, and other events arrive in between. These rules
+keep the jukebox queue consistent.
+
+| Flag | Set when | Cleared when | While set |
+|---|---|---|---|
+| `filling` | `StartRefill` is emitted | `RefillDone`, `RefillFailed`, `Connected` | no run, no top-up, no retry of failed adds; a database check is deferred (`revalidate`) |
+| `enqueuing` | `Enqueue` is emitted | `Enqueued`, `Connected` | no run, no top-up |
+| `validating` | `Validate` is emitted | `Validated`, `Connected` | another check is deferred (`revalidate`) |
+| `revalidate` | a check is due but deferred | the deferred check starts | — |
+| `halted` | `RefillFailed`, or `add_failures` reaches the queue size | `Restart` | no run, no top-up; the jukebox timer is cancelled |
+
+- **Only the core changes the jukebox queue**, and the shell persists every
+  change (`Persist`) before handling the next event.
+- **Nothing takes entries during a refill.** A refill starts from a snapshot
+  of the jukebox queue (`existing`) and `RefillDone` replaces the jukebox
+  queue with it plus the new picks. An entry taken in between would come
+  back, and be added twice.
+- **At most one `Enqueue` is in flight.** Its `Enqueued` carries fresh status,
+  and only then does the core decide whether more entries are needed (failed
+  adds, §5.1) or whether to top up. A second run in between could act on a
+  status from before the first `Enqueue` finished.
+- **Database checks may overlap anything but refills and other checks.**
+  `Validated` removes entries by key from the jukebox queue as it is *then*,
+  so entries taken or added while the check ran are handled correctly. A
+  refill's picks may come from a database that is being updated, so a check
+  deferred by a refill runs right after `RefillDone`.
+- **`Connected` starts over.** The shell cancels its background tasks and
+  drops their pending events when a connection ends, so `Connected` clears
+  `filling`, `enqueuing` and `validating`, and checks the jukebox queue
+  against the database, which may have changed while we were away.
+- **`halted` only stops adding.** Scrobbles, the history, database checks
+  and the jukebox queue's persistence carry on.
 
 ---
 
@@ -428,7 +469,9 @@ picks, and a different seed gives different ones.
   missing. If adds fail `queue_length_song` (or `queue_length_album`) times
   in a row, the jukebox halts instead of churning through picks forever.
 - **Database changes** (§7.1). On idle `database`, and on every connect, the
-  core asks the shell to `Validate` the jukebox queue. A background task
+  core asks the shell to `Validate` the jukebox queue. In album mode, idle
+  `database` only (re)arms the `validate` timer, so the check runs once the
+  database has been quiet for `album_check_delay` seconds (§4.5). A background task
   checks each entry: `find file <uri>` in song mode, or membership in a
   rebuilt album index in album mode. The core then drops the missing
   entries, persists the rest and tops up if needed. A change during a check
@@ -473,8 +516,9 @@ picks, and a different seed gives different ones.
 - `Enqueue` for albums: the shell looks up the album and runs `add` for each
   of its URIs, sorted by (disc, track, uri). python-mpd2's asyncio client
   has no command lists, so these are separate `add` commands. An album counts
-  as added if at least one of its songs was added. myMPD uses `searchadd`
-  (§7.1).
+  as added if at least one of its songs was added; if some were missing, a
+  warning names the album and how many songs it lacked. myMPD uses
+  `searchadd` (§7.1).
 
 ### 5.3 Persistence (`store.py`, aiosqlite)
 
@@ -500,7 +544,7 @@ CREATE TABLE history (
     id  INTEGER PRIMARY KEY,      -- newest = highest id
     uri TEXT NOT NULL,
     ts  INTEGER NOT NULL
-);  -- capped at last_played_count
+);  -- see the pruning rule below
 ```
 
 - `constraint_fingerprint` is a pure hash of the settings that decide what
@@ -508,6 +552,12 @@ CREATE TABLE history (
   table. On startup, a saved jukebox queue is discarded if the fingerprint
   differs. This covers both myMPD's mode check on load and its
   clear-on-change rule.
+- **History pruning.** A row is deleted only when it is both beyond the
+  newest `last_played_count` rows and older than the `last_played` window.
+  The history serves two purposes: recent songs for uniqueness (§1.6), and
+  last-played times when MPD has no sticker database (§7.1). The window
+  rule keeps the second exact however many songs are played. A
+  `last_played_count` of 0 turns the history off.
 - `Persist` rewrites `jukebox_queue` in one transaction. The queue holds at
   most about 1100 rows, so a full rewrite is cheap.
 - The schema version is not kept in `meta`. It is SQLite's built-in
@@ -860,7 +910,8 @@ same suite, and `nix flake check` adds the VM test of §5.7.
    this case.
 5. **Album enqueue** adds the URIs collected in our album index, one `add`
    per song, instead of `searchadd` with an album expression. An album
-   counts as added if at least one of its songs was added.
+   counts as added if at least one of its songs was added, with a warning
+   if some were missing.
 6. **Album tags** are merged across the album's songs: each tag keeps its
    distinct values in order of first appearance. `last_modified` is the
    newest and `added` the oldest of its songs, as in myMPD.
@@ -879,8 +930,9 @@ same suite, and `nix flake check` adds the VM test of §5.7.
 
 - **A short refill halts the jukebox.** With strict filters or a small
   library, this happens as soon as fewer than `queue_length_song + add`
-  candidates match. myMPD sets `mode = off`; we have no `off` mode, so the
-  core sets `halted` and stores `last_error`. The daemon keeps running and
+  candidates match. myMPD sets `mode = off` and stores the error for its
+  UI; we have no `off` mode, so the core sets `halted` and logs the
+  reason. The daemon keeps running and
   keeps recording play history, but adds nothing until SIGHUP (`Restart`)
   or a process restart.
 - **Failed adds are replaced** by the next entries of the jukebox queue

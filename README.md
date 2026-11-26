@@ -117,7 +117,7 @@ queue_length_song = 100     # songs picked in advance, 10–1000
 queue_length_song_min = 10  # refill below this, 10–500
 queue_length_album = 25     # albums picked in advance, 5–250
 queue_length_album_min = 5  # refill below this, 5–125
-last_played_count = 2000    # play history entries kept; 0 = none
+last_played_count = 2000    # history kept, plus all within last_played; 0 = none
 write_stickers = false      # write playCount and lastPlayed like myMPD
 
 [albums]

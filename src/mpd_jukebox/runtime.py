@@ -413,7 +413,10 @@ class Runtime:
                 self._cancel_timer(name)
             case core.RecordPlay(uri, played_at, started_at):
                 await self.store.record_play(
-                    uri, played_at, self.cfg.last_played_count
+                    uri,
+                    played_at,
+                    keep=self.cfg.last_played_count,
+                    since=played_at - self.cfg.last_played_hours * 3600,
                 )
                 if self.cfg.write_stickers:
                     await io.record_play_stickers(uri, started_at)
@@ -447,7 +450,15 @@ class Runtime:
                 )
                 continue
             results = [await io.add(uri) for uri in album.uris]
-            if any(results):
+            done = sum(results)
+            if done:
                 log.info('Jukebox adding album: %s', entry.tag_value)
                 added += 1
+            if 0 < done < len(results):
+                log.warning(
+                    'Album %s added without %d of its %d songs',
+                    entry.tag_value or entry.key,
+                    len(results) - done,
+                    len(results),
+                )
         return added
