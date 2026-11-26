@@ -191,7 +191,9 @@ services.mpd-jukebox = {
   reason.
 - The service runs as a dynamic user with systemd sandboxing, and keeps its
   state in `/var/lib/mpd-jukebox`. `systemctl reload mpd-jukebox` sends
-  `SIGHUP`.
+  `SIGHUP`. A wrong password or configuration leaves the service failed
+  (exit status 78) instead of restarting it every 10 seconds; the journal
+  says why.
 - The configuration is also at `/etc/mpd-jukebox/config.toml`, for
   `sudo mpd-jukebox --config /etc/mpd-jukebox/config.toml list`.
 

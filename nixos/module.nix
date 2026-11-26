@@ -224,10 +224,13 @@ in
         DynamicUser = true;
         StateDirectory = "mpd-jukebox";
         LoadCredential = lib.optional (cfg.passwordFile != null) "mpd-password:${cfg.passwordFile}";
-        # A wrong password or a broken database also lands here; the
-        # journal says why.
+        # Lost MPD connections are retried inside the daemon; this covers
+        # unexpected crashes. Exit status 78 (EX_CONFIG) means a wrong
+        # password, permission or configuration, which restarting cannot
+        # fix: the unit stays failed and the journal says why.
         Restart = "on-failure";
         RestartSec = "10s";
+        RestartPreventExitStatus = 78;
       };
     };
   };

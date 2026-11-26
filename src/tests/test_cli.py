@@ -6,7 +6,7 @@ from unittest import mock
 
 from click.testing import CliRunner
 
-from mpd_jukebox.cli import main
+from mpd_jukebox.cli import EX_CONFIG, main
 from mpd_jukebox.model import Entry
 from mpd_jukebox.store import Store, load_migrations
 
@@ -58,13 +58,13 @@ class CliTestCase(unittest.TestCase):
     def test_config_error(self):
         path = self.config('[jukebox]\nmode = "off"\n')
         result = self.invoke(['--config', path, 'list'])
-        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(result.exit_code, EX_CONFIG)
         self.assertIn('jukebox.mode', result.output)
 
     def test_fuzzy_filter_is_rejected(self):
         path = self.config('[jukebox]\nfilter_include = "(Artist ~~ \'x\')"\n')
         result = self.invoke(['--config', path, 'list'])
-        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(result.exit_code, EX_CONFIG)
         self.assertIn('fuzzy', result.output)
 
     def test_check(self):
@@ -79,7 +79,7 @@ class CliTestCase(unittest.TestCase):
     def test_check_rejects_bad_config(self):
         path = self.config('[mpd]\npassword = "a"\npassword_file = "/p"\n')
         result = self.invoke(['--config', path, 'check'])
-        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(result.exit_code, EX_CONFIG)
         self.assertIn('mutually exclusive', result.output)
 
     def test_run_reads_password_file(self):
@@ -100,7 +100,7 @@ class CliTestCase(unittest.TestCase):
     def test_run_missing_password_file(self):
         path = self.config('[mpd]\npassword_file = "/nonexistent"\n')
         result = self.invoke(['--config', path, 'run'])
-        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(result.exit_code, EX_CONFIG)
         self.assertIn('cannot read password file', result.output)
 
     def test_list_without_state(self):
@@ -124,6 +124,27 @@ class CliTestCase(unittest.TestCase):
         result = self.invoke(['--config', path, 'list'])
         self.assertEqual(result.exit_code, 0, result.output)
 
+    def test_print_lines_survives_a_closed_pipe(self):
+        from mpd_jukebox import cli
+
+        stdout = mock.Mock(fileno=mock.Mock(return_value=17))
+        with (
+            mock.patch('click.echo', side_effect=BrokenPipeError),
+            mock.patch.object(cli.sys, 'stdout', stdout),
+            mock.patch.object(cli.os, 'open', return_value=42) as open_,
+            mock.patch.object(cli.os, 'dup2') as dup2,
+        ):
+            cli.print_lines(['a', 'b'])
+        open_.assert_called_once_with(os.devnull, os.O_WRONLY)
+        dup2.assert_called_once_with(42, 17)
+
+    def test_print_lines_writes_once(self):
+        from mpd_jukebox import cli
+
+        with mock.patch('click.echo') as echo:
+            cli.print_lines(['a', 'b'])
+        echo.assert_called_once_with('a\nb\n', nl=False)
+
     def test_list_old_schema(self):
         async def prepare():
             store = await Store.open(self.state)
@@ -131,7 +152,7 @@ class CliTestCase(unittest.TestCase):
 
         asyncio.run(prepare())
         result = self.invoke(['list'])
-        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(result.exit_code, EX_CONFIG)
         self.assertIn('run the daemon', result.output)
 
     def test_select(self):
@@ -187,7 +208,7 @@ class CliTestCase(unittest.TestCase):
         fake = FakeMPD(library(5), password='pw')
         with mock.patch('mpd_jukebox.cli._install_signals'):
             result = self.invoke(['--password', 'nope', 'run'], fake)
-        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(result.exit_code, EX_CONFIG)
         self.assertIn('incorrect password', result.output)
 
     def test_install_signals(self):

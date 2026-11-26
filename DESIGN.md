@@ -56,7 +56,8 @@ Constants: `JUKEBOX_ADD_SONG_MAX = 99`, `JUKEBOX_UNIQ_RANGE = 50`,
 myMPD keeps two queues:
 
 1. The **MPD queue**, which is what plays.
-2. The **jukebox queue**, an internal list of already-picked candidates. Each
+2. The **jukebox queue**, an internal list of songs or albums picked in
+   advance. Its entries are also called **picks** in this document. Each
    entry is `(key, lineno, tag_value)`, where `key` is a song URI or an album
    key. In song mode the list holds about 100 entries, in album mode about 25.
 
@@ -456,7 +457,7 @@ keep the jukebox queue consistent.
   resumes idling afterwards, so a second connection is not needed.
 - An `asyncio.Queue[Event]` collects events from the idle listener, the timers
   (`loop.call_later` handles keyed by name; `SetTimer` replaces an existing
-  timer) and the refill task.
+  timer), the refill and database-check tasks, and the results of `Enqueue`.
 - At most one refill task runs at a time. The core enforces this with
   `filling`, and the shell asserts it as well.
 - The main loop is `state, effs = update(cfg, state, ev)`, then each effect is
@@ -471,21 +472,26 @@ keep the jukebox queue consistent.
 - **Database changes** (§7.1). On idle `database`, and on every connect, the
   core asks the shell to `Validate` the jukebox queue. In album mode, idle
   `database` only (re)arms the `validate` timer, so the check runs once the
-  database has been quiet for `album_check_delay` seconds (§4.5). A background task
-  checks each entry: `find file <uri>` in song mode, or membership in a
-  rebuilt album index in album mode. The core then drops the missing
-  entries, persists the rest and tops up if needed. A change during a check
-  or a refill leads to another check once it finishes, so picks made from a
-  database that was being updated are checked too.
+  database has been quiet for `album_check_delay` seconds (§4.5). A
+  background task checks each entry: `find file <uri>` in song mode, or
+  membership in a rebuilt album index in album mode. The core then drops the
+  missing entries, persists the rest and tops up if needed. A change during
+  a check or a refill leads to another check once it finishes, so picks made
+  from a database that was being updated are checked too.
 - The connection authenticates with `password` first if one is configured
   (§5.5).
-- A failure in a background task (idle listener, timer, refill) is forwarded
-  to the main loop. Connection errors, and MPD errors other than password or
-  permission errors, end the session and lead to a reconnect.
+- A failure in a background task (idle listener, timer, refill, database
+  check) is forwarded to the main loop. Connection errors end the session
+  and lead to a reconnect, as do unexpected MPD errors. Password and
+  permission errors end the program (§5.5). A refill is the exception: any
+  other error during a refill, such as MPD rejecting the include filter,
+  becomes `RefillFailed` and halts the jukebox.
 - Reconnect uses exponential backoff. On every connect and reconnect a
   `Connected` event is emitted, and the core treats it like a queue change:
-  the jukebox runs if MPD's queue is shorter than `queue_length`. A refill
-  that was running is cancelled and `filling` is reset.
+  the jukebox runs if MPD's queue is shorter than `queue_length`. Background
+  tasks of the old connection are cancelled and their pending events
+  dropped, and `Connected` resets `filling`, `enqueuing` and `validating`
+  (§4.6).
 - On SIGHUP: emit `Restart`. This is how to resume after a failed refill
   halted the jukebox (§7.2), without restarting the process.
 - On SIGINT/SIGTERM: cancel tasks, disconnect and exit with status 0. Every
@@ -509,10 +515,10 @@ keep the jukebox queue consistent.
   example), it is rebuilt once.
 - Stickers: `sticker find song "" lastPlayed` and `sticker find song "" like`
   become immutable `Mapping[uri, str]`. If stickers are unavailable (MPD
-  answers "unknown command" or there is no sticker DB), these are empty and
-  the sticker constraints pass. In that case the last-played check falls back
-  to the local history table, so the "last played" constraint still works
-  without stickers.
+  answers "unknown command" or there is no sticker DB), the result is `None`,
+  not an empty mapping: `None` switches the last-played check to the local
+  history table, so the "last played" constraint still works without
+  stickers, and the hated-song check passes everything.
 - `Enqueue` for albums: the shell looks up the album and runs `add` for each
   of its URIs, sorted by (disc, track, uri). python-mpd2's asyncio client
   has no command lists, so these are separate `add` commands. An album counts
@@ -557,7 +563,8 @@ CREATE TABLE history (
   The history serves two purposes: recent songs for uniqueness (§1.6), and
   last-played times when MPD has no sticker database (§7.1). The window
   rule keeps the second exact however many songs are played. A
-  `last_played_count` of 0 turns the history off.
+  `last_played_count` of 0 turns the history off; without stickers, that
+  also turns the `last_played` rule off, since nothing records plays.
 - `Persist` rewrites `jukebox_queue` in one transaction. The queue holds at
   most about 1100 rows, so a full rewrite is cheap.
 - The schema version is not kept in `meta`. It is SQLite's built-in
@@ -659,6 +666,8 @@ it. For the MPD address and password, the environment variables `MPD_HOST`
 and `MPD_PORT` are also accepted (§5.5).
 
 ```toml
+# state_file = "…"         # top level; default $XDG_STATE_HOME/mpd-jukebox/state.sqlite
+
 [mpd]                      # every key is optional; see §5.5 for precedence
 # host = "localhost"       # hostname, IP, /path/to/socket, @abstract, or "password@host"
 # port = 6600
@@ -742,8 +751,8 @@ supported.
 - **Host and password** come from the highest-priority source that sets a
   host: `--host`, then `[mpd].host`, then `MPD_HOST`, then the default
   `localhost`. Any of these may use the `password@host` form.
-  - The password is taken **from the same source as the host**, or from an
-    explicit `--password` / `[mpd].password`.
+  - The password is, in order: `--password`, then a password embedded in
+    the chosen host (`password@host`), then `[mpd].password`.
   - A password from one source is never combined with a host from another.
     Otherwise a global `MPD_HOST=secret@home-server` would send `secret` to
     a different host set in the config file.
@@ -767,8 +776,8 @@ connection sends `password <secret>` if a password is set. The same happens
 on every reconnect.
 
 - A wrong password (`ACK [3@0] … incorrect password`) is a fatal error. The
-  daemon exits with a non-zero status instead of retrying, because retrying
-  cannot fix a configuration problem.
+  daemon exits with status 78 (`EX_CONFIG`) instead of retrying, because
+  retrying cannot fix a configuration problem (§5.6, §5.7).
 - A permission error (`ACK [4@0]`) on a later command is treated the same
   way. This happens, for example, when MPD requires a password for `add` and
   none was given.
@@ -785,6 +794,13 @@ on every reconnect.
   It reads the play history from the state database if one exists. This is
   useful for debugging filters and constraints.
 
+**Exit status.** 0 on success, 78 (`EX_CONFIG`) for problems only a
+configuration change can fix: an invalid configuration or password file, a
+wrong password or missing permission, or a state database written by a newer
+version. Other errors exit with 1. `list` and `select` write their output in
+one piece, and a reader that goes away early (`… | head -n 1`) is not an
+error.
+
 Global options: `--config`, `--debug` (debug output from this program and
 python-mpd2 only), `--state` (the state database; also the top-level
 `state_file` key in the config file), `--host`, `--port` and `--password`
@@ -796,7 +812,9 @@ so `MPD_HOST` or the config file is the better place for a password.
 `run` sends `READY=1` to `$NOTIFY_SOCKET` (`systemd.py`, no libsystemd)
 once its signal handlers are installed. The unit is `Type=notify`, so a
 `systemctl reload` (SIGHUP) sent during startup waits instead of killing the
-process with the default signal action.
+process with the default signal action. Readiness does not wait for MPD:
+an MPD that is not up yet must not fail the unit, since the daemon retries
+the connection itself.
 
 The NixOS module `services.mpd-jukebox`:
 
@@ -814,9 +832,10 @@ The NixOS module `services.mpd-jukebox`:
   database is `/var/lib/mpd-jukebox/state.sqlite`) and systemd hardening:
   `ProtectSystem=strict`, no capabilities, only `AF_UNIX`/`AF_INET`/`AF_INET6`
   sockets and the `@system-service` system calls. `ExecReload` sends SIGHUP.
-  It is ordered
-  after `mpd.service` (or `mpd.socket`) when the local MPD is enabled, and it
-  restarts on failure after 10 s.
+  It is ordered after `mpd.service` (or `mpd.socket`) when the local MPD is
+  enabled. It restarts on failure after 10 s, except after exit status 78
+  (`RestartPreventExitStatus=78`): then the unit stays failed and the
+  journal says why.
 
 The VM test (`nixos/test.nix`, flake output `checks.<system>.nixos-module`)
 runs two machines with a real MPD, a null audio output and 90 generated
@@ -833,7 +852,8 @@ runs two machines with a real MPD, a null audio output and 90 generated
 The `tcp` machine's music is a writable copy, so the test can also change the
 library under the jukebox: a picked song deleted while it runs is dropped
 after `mpc update`, and a pick deleted while it is stopped is skipped when
-its turn comes.
+its turn comes. Finally a runtime drop-in swaps the password credential for a
+wrong one: the service exits with 78, stays failed and is not restarted.
 
 ---
 
@@ -850,7 +870,9 @@ same suite, and `nix flake check` adds the VM test of §5.7.
     failure halts and `Restart` resumes; failed adds are replaced by the next
     entries, a run with no entries left refills, and endless failures halt;
     `filling` and `enqueuing` block other runs; database checks drop missing
-    entries and are repeated after a change during a check or refill;
+    entries and are repeated after a change during a check or refill, and
+    after a check that finished during a refill; album mode waits for a
+    quiet database;
   - the selection fold with fixed seeds: deterministic, uniqueness never
     broken over many seeds, pre-existing entries never touched, a short
     result is a failure;
@@ -859,8 +881,11 @@ same suite, and `nix flake check` adds the VM test of §5.7.
 - **Shell.** A fake MPD client (`tests/fake_mpd.py`, an in-memory object
   with the same async methods) and a temporary SQLite file. The runtime is
   tested end to end against it: filling and playing, saved queues, halting
-  and restarting, reconnects, password handling, album mode, playlist
-  sources, failed adds, stale saved entries and database changes.
+  and restarting, reconnects, password handling, album mode (including
+  albums added only in part), playlist sources, failed adds, stale saved
+  entries and database changes. The store tests cover history pruning,
+  including the `last_played` window. The CLI tests cover the exit statuses
+  and output to a closed pipe.
 - **MPD address and password.** Every row of the `parse_mpd_host` table in
   §5.5, a bad `MPD_PORT`, precedence, a password in `MPD_HOST` not being
   sent to a host from the config file, conflicting passwords,
@@ -932,9 +957,8 @@ same suite, and `nix flake check` adds the VM test of §5.7.
   library, this happens as soon as fewer than `queue_length_song + add`
   candidates match. myMPD sets `mode = off` and stores the error for its
   UI; we have no `off` mode, so the core sets `halted` and logs the
-  reason. The daemon keeps running and
-  keeps recording play history, but adds nothing until SIGHUP (`Restart`)
-  or a process restart.
+  reason. The daemon keeps running and keeps recording play history, but
+  adds nothing until SIGHUP (`Restart`) or a process restart.
 - **Failed adds are replaced** by the next entries of the jukebox queue
   until the wanted number is in MPD's queue (§1.5, §5.1).
 - **Quirks:** empty uniq-tag values collide with each other; with

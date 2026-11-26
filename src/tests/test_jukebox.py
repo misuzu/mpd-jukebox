@@ -374,6 +374,23 @@ class ValidationTestCase(unittest.TestCase):
         self.assertTrue(state.validating)
         self.assertFalse(state.revalidate)
 
+    def test_check_finishing_during_a_refill_checks_again(self):
+        # The check started first; a refill started while it ran.
+        state = State(jukebox_queue=entries(20), validating=True, filling=True)
+        state, effects = update(CFG, state, Validated(frozenset({'s0'}), NOW))
+        self.assertTrue(state.revalidate)
+        self.assertEqual(of_type(effects, Validate), [])
+        # The refill's snapshot still holds s0; the deferred check runs.
+        state, effects = update(CFG, state, RefillDone(entries(100), 0, NOW))
+        self.assertEqual(
+            of_type(effects, Validate), [Validate(Mode.SONG, entries(100))]
+        )
+
+    def test_check_finding_nothing_during_a_refill(self):
+        state = State(jukebox_queue=entries(20), validating=True, filling=True)
+        state, _ = update(CFG, state, Validated(frozenset(), NOW))
+        self.assertFalse(state.revalidate)
+
     def test_album_mode_waits_for_a_quiet_database(self):
         cfg = replace(CFG, mode=Mode.ALBUM, album_check_delay=30)
         state = State(jukebox_queue=entries(20))

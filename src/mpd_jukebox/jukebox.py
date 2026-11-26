@@ -430,6 +430,11 @@ def _on_validated(cfg: Config, state: State, event: Validated) -> Step:
     effects: tuple[Effect, ...] = ()
     dropped = len(state.jukebox_queue) - len(kept)
     state = replace(state, validating=False, jukebox_queue=kept)
+    if state.filling and event.missing:
+        # A refill started during this check works from a snapshot that
+        # may still hold the missing entries; RefillDone would bring them
+        # back. Check again once it is done.
+        state = replace(state, revalidate=True)
     if dropped:
         effects += (
             Log(

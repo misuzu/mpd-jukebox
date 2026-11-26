@@ -4,8 +4,9 @@ import asyncio
 import logging
 import os
 import signal
+import sys
 import time
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -33,6 +34,17 @@ from .store import Store, StoreError, default_path, load_migrations
 from .systemd import notify
 
 log = logging.getLogger(__name__)
+
+
+# sysexits' EX_CONFIG: the configuration is wrong, so restarting cannot help.
+# The NixOS module tells systemd not to restart on it.
+EX_CONFIG = 78
+
+
+class ConfigurationError(click.ClickException):
+    """A problem only a configuration change can fix."""
+
+    exit_code = EX_CONFIG
 
 
 @dataclass(frozen=True)
@@ -67,18 +79,32 @@ def load(options: Options, *, read_secrets: bool = True) -> Loaded:
             os.environ,
         )
     except ConfigError as e:
-        raise click.ClickException(str(e)) from e
+        raise ConfigurationError(str(e)) from e
     for warning in settings.warnings:
         log.warning('%s', warning)
     state_file = options.state_file or settings.state_file or default_path()
     return Loaded(settings, connection, state_file)
 
 
+def print_lines(lines: Iterable[str]) -> None:
+    """Write all lines at once, so `mpd-jukebox list | head -n 1` does not
+    fail half-way; a reader that went away anyway is not an error."""
+    text = ''.join(f'{line}\n' for line in lines)
+    try:
+        click.echo(text, nl=False)
+    except BrokenPipeError:
+        # Python would complain again when flushing stdout at exit.
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+
+
 def run_async(coro: Coroutine[Any, Any, None]) -> None:
     try:
         asyncio.run(coro)
     except (StoreError, FatalMpdError) as e:
-        raise click.ClickException(str(e)) from e
+        # A wrong password or missing permission, or a database written by
+        # a newer version.
+        raise ConfigurationError(str(e)) from e
 
 
 @click.group()
@@ -196,8 +222,10 @@ async def _list(path: str) -> None:
         entries = await store.queue()
     finally:
         await store.close()
-    for pos, entry in enumerate(entries):
-        click.echo(f'{pos}\t{entry.key}\t{entry.tag_value}')
+    print_lines(
+        f'{pos}\t{entry.key}\t{entry.tag_value}'
+        for pos, entry in enumerate(entries)
+    )
 
 
 @main.command()
@@ -241,8 +269,7 @@ async def _select(
             await store.close()
     if isinstance(result, core.RefillFailed):
         raise click.ClickException(result.error)
-    for entry in result.entries:
-        click.echo(f'{entry.key}\t{entry.tag_value}')
+    print_lines(f'{entry.key}\t{entry.tag_value}' for entry in result.entries)
 
 
 async def _optional_store(path: str) -> Store | None:

@@ -230,6 +230,41 @@ pkgs.testers.runNixOSTest {
         assert f"Adding {gone} failed, skipping it" in journal, journal
         assert gone not in playlist(tcp, tcp_host)
 
+    with subtest("a wrong password stops the service without restarts"):
+        # Swap the credential for a wrong password with a runtime drop-in.
+        tcp.succeed(
+            "echo wrong > /run/wrong-password",
+            "mkdir -p /run/systemd/system/mpd-jukebox.service.d",
+            "printf '[Service]\\nLoadCredential=\\n"
+            "LoadCredential=mpd-password:/run/wrong-password\\n' "
+            "> /run/systemd/system/mpd-jukebox.service.d/wrong.conf",
+            "systemctl daemon-reload",
+        )
+        # It is ready before it connects (MPD may be away at boot), so the
+        # restart itself succeeds and the failure follows.
+        tcp.succeed("systemctl restart mpd-jukebox.service")
+        tcp.wait_until_succeeds(
+            "systemctl is-failed mpd-jukebox.service", timeout=30
+        )
+        assert "78" in tcp.succeed(
+            "systemctl show -p ExecMainStatus --value mpd-jukebox.service"
+        )
+        # Restart=on-failure would have tried again after 10 s.
+        tcp.sleep(12)
+        tcp.succeed("systemctl is-failed mpd-jukebox.service")
+        assert tcp.succeed(
+            "systemctl show -p NRestarts --value mpd-jukebox.service"
+        ).strip() == "0"
+        assert "incorrect password" in tcp.succeed(
+            "journalctl -u mpd-jukebox.service"
+        )
+        tcp.succeed(
+            "rm /run/systemd/system/mpd-jukebox.service.d/wrong.conf",
+            "systemctl daemon-reload",
+            "systemctl restart mpd-jukebox.service",
+        )
+        tcp.wait_for_unit("mpd-jukebox.service")
+
     with subtest("album mode adds whole albums in track order"):
         socket_host = "/run/mpd/socket"
         prepare(socket, socket_host)
