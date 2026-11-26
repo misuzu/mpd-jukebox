@@ -28,6 +28,7 @@ from .runtime import (
     Refiller,
     Runtime,
     connect_client,
+    prepare,
     random_seed,
 )
 from .store import Store, StoreError, default_path, load_migrations
@@ -254,8 +255,7 @@ async def _select(
     client = await connect(loaded.connection)
     try:
         io = MpdIO(client)
-        if loaded.connection.password is not None:
-            await io.password(loaded.connection.password)
+        await prepare(io, loaded.settings, loaded.connection)
         refiller = Refiller(
             loaded.settings,
             store if store is not None else NoHistory(),

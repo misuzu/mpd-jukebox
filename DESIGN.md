@@ -269,7 +269,7 @@ inputs the fold always produces the same result.
 | `config.py` | core, plus file reading | `parse_config` (pure) and `fingerprint`; `read_config_file` reads the TOML file (§5.4) |
 | `mpd_io.py` | shell | Pure parsers of python-mpd2 results, and `MpdIO`, a thin wrapper around the client (§5.2) |
 | `store.py` | shell | aiosqlite: migrations, the jukebox queue, play history, meta (§5.3) |
-| `runtime.py` | shell | `Refiller` (gathers refill inputs, drives the fold) and `Runtime` (the event loop and effect interpreter) (§5.1) |
+| `runtime.py` | shell | `prepare` (connection set-up), `Refiller` (gathers refill inputs, drives the fold, caches the album index) and `Runtime` (the event loop and effect interpreter) (§5.1) |
 | `systemd.py` | shell | `notify`: `sd_notify` without libsystemd (§5.7) |
 | `cli.py` | shell | click entry points (§5.6) |
 | `migrations/` | data | Schema migrations as `NNNN_description.sql` files (§5.3.1) |
@@ -363,7 +363,8 @@ reference for those.
   `scrobble_timer` turn a `Status` into `SetTimer` or `CancelTimer` (§1.3,
   §1.10). The handlers for `Enqueued` and `Validated` implement the
   failed-add and database rules of §5.1.
-- **`constraints.py`.** `make_context` bundles the constraints for one
+- **`constraints.py`.** `needed_tags` lists the tags the configuration
+  reads (§4.5). `make_context` bundles the constraints for one
   refill: durations, the last-played cut-off, the last-played map, hated
   URIs, and the include/exclude predicate. `song_candidate` and
   `album_candidate` apply them to one song or album and return a
@@ -393,20 +394,45 @@ picks, and a different seed gives different ones.
 
 ### 4.5 Performance
 
-- The reservoir is small (at most about 1100 entries). It is held as a tuple
-  and replaced with a new tuple on each change, which costs O(k) per
-  accepted candidate. Accepted candidates are rare once the reservoir is
-  full.
-- Uniqueness checks are set lookups: the keys and tag values of the
+The cost that matters is reading the library from MPD. Measured on a library
+of about 56,000 songs: a full read (`search file ""`, in windows of 10,000)
+is about 20 MB and keeps MPD busy for about 10 s; the jukebox's own CPU time
+for it is well under a second. Everything else is small: about 1.2 MB for
+the `lastPlayed` stickers of 8,400 played songs, about 380 bytes per
+`find file` or `lsinfo`, about 750 bytes per `status` and `currentsong`.
+
+- **Only the tags in use.** After authenticating, the connection asks MPD
+  for only the tags this configuration reads (`tagtypes clear`, then
+  `tagtypes enable …`; `needed_tags`): the uniq tag (and `name` for
+  `Title`), the tags in the filters, and in album mode the album-key tags
+  and disc and track. A filter using `any` keeps all tags. File names,
+  durations and dates are always sent, so this saves the tag part only: on
+  the library above, a song-mode read with `uniq_tag = "Album"` drops from
+  20 MB to 14 MB, an album-mode read to 17 MB. An MPD without `tagtypes
+  clear` (before 0.21) sends everything.
+- **Song mode** reads the library once per refill, streaming it window by
+  window; nothing is held in memory. A top-up adds about 90 picks, so there
+  is one read per about 90 songs played. A database check costs one `find
+  file` per pick, about 40 KB.
+- **Album mode** needs every song to build the album index. The index is
+  kept per database *generation*, which goes up on every database change
+  and every reconnect. Refills, adds and checks reuse the index while its
+  generation is current, and callers that need it while it is being built
+  share that build, so a start or a reconnect reads the library once.
+- **Album checks** do not need a current index. With a stale one, the songs
+  of each picked album are looked up (`find file`, a few hundred small
+  queries for 25 albums); only if a picked album changed, or is missing
+  from the cached index, is the index rebuilt. A database update that does
+  not touch the picks therefore costs some 100 KB instead of a library
+  read. Album mode still waits for `album_check_delay` (30) seconds of
+  quiet before checking (§5.1), which keeps bursts of updates down to one
+  check.
+- The reservoir is small (at most about 1100 entries). It is held as a
+  tuple and replaced with a new tuple on each change, which costs O(k) per
+  accepted candidate; accepted candidates are rare once it is full.
+  Uniqueness checks are set lookups: the keys and tag values of the
   uniqueness context, and of the entries picked so far, are kept in
   frozensets. myMPD scans its lists instead.
-- In song mode, library songs are streamed window by window and never all
-  held in memory. Album mode needs every song to build the album index. The
-  index is cached in the shell and rebuilt by each album refill and each
-  database check (§5.1), so a database check in album mode costs a full
-  library scan in the background. To keep bursts of updates (MPD's
-  `auto_update`) from causing a scan each, album mode checks only once the
-  database has been quiet for `album_check_delay` (30) seconds.
 
 ### 4.6 Concurrency rules
 
@@ -473,13 +499,24 @@ keep the jukebox queue consistent.
   core asks the shell to `Validate` the jukebox queue. In album mode, idle
   `database` only (re)arms the `validate` timer, so the check runs once the
   database has been quiet for `album_check_delay` seconds (§4.5). A
-  background task checks each entry: `find file <uri>` in song mode, or
-  membership in a rebuilt album index in album mode. The core then drops the
+  background task checks each entry: `find file <uri>` in song mode. In
+  album mode, a current index is enough; otherwise the songs of each
+  picked album are looked up, and the index is rebuilt only if a picked
+  album changed (§4.5). The core then drops the
   missing entries, persists the rest and tops up if needed. A change during
   a check or a refill leads to another check once it finishes, so picks made
   from a database that was being updated are checked too.
-- The connection authenticates with `password` first if one is configured
-  (§5.5).
+- **Connection set-up** (`prepare`, also used by `select`): `password`
+  first if one is configured (§5.5), then `tagtypes` to ask for only the
+  tags in use (§4.5).
+- **`Enqueue` runs as a background task**, like refills and checks: in album
+  mode it may have to wait for the album index, and events must keep
+  flowing meanwhile. The core's `enqueuing` flag keeps it to one at a time
+  (§4.6).
+- **The album index** lives in `Refiller` with the database generation it
+  was built for. Idle `database` and every new connection raise the
+  generation; a build in progress is shared by all callers and cancelled
+  when the connection ends.
 - A failure in a background task (idle listener, timer, refill, database
   check) is forwarded to the main loop. Connection errors end the session
   and lead to a reconnect, as do unexpected MPD errors. Password and
@@ -510,9 +547,10 @@ keep the jukebox queue consistent.
   - Include and exclude are **always** also evaluated locally, as in myMPD.
 - Album source: read every song with windowed `search file ""` calls, then
   group them with the pure `albums.build_albums`. The index is cached in
-  `Refiller` and rebuilt by each album refill and each database check. If
-  an album to be added is missing from it (after a daemon restart, for
-  example), it is rebuilt once.
+  `Refiller` per database generation (§5.1). Adding an album uses the
+  cached index, even a stale one, as long as it has the album; otherwise
+  the index is rebuilt once. A stale index can lack songs added to an
+  album since; they are picked up at the next rebuild.
 - Stickers: `sticker find song "" lastPlayed` and `sticker find song "" like`
   become immutable `Mapping[uri, str]`. If stickers are unavailable (MPD
   answers "unknown command" or there is no sticker DB), the result is `None`,
@@ -880,10 +918,15 @@ same suite, and `nix flake check` adds the VM test of §5.7.
     with and without MBID; tag helpers and normalisation.
 - **Shell.** A fake MPD client (`tests/fake_mpd.py`, an in-memory object
   with the same async methods) and a temporary SQLite file. The runtime is
-  tested end to end against it: filling and playing, saved queues, halting
+  tested end to end against it. It honours `tagtypes`, so the tests also
+  show that every tag the jukebox reads is requested. Covered: filling and
+  playing, saved queues, halting
   and restarting, reconnects, password handling, album mode (including
   albums added only in part), playlist sources, failed adds, stale saved
-  entries and database changes. The store tests cover history pruning,
+  entries and database changes, one library read per album-index
+  generation (shared by concurrent callers, retried after a failure), and
+  album checks that leave the library alone when the picks are intact. The
+  store tests cover history pruning,
   including the `last_played` window. The CLI tests cover the exit statuses
   and output to a closed pipe.
 - **MPD address and password.** Every row of the `parse_mpd_host` table in

@@ -4,6 +4,8 @@ import tempfile
 import unittest
 from dataclasses import replace
 
+from mpd.base import CommandError
+
 from mpd_jukebox import jukebox as core
 from mpd_jukebox.config import Settings, fingerprint, parse_config
 from mpd_jukebox.connection import Connection
@@ -146,7 +148,11 @@ class RuntimeTestCase(unittest.IsolatedAsyncioTestCase):
         second = FakeMPD(library(150), password='pw')
         await self.start([first, second], connection=Connection(password='pw'))
         await wait_for(lambda: first.state == 'play')
-        self.assertEqual(first.commands[0], 'password')
+        # Authenticate, then ask for only the tags the jukebox reads.
+        self.assertEqual(
+            first.commands[:3], ['password', 'tagtypes', 'tagtypes']
+        )
+        self.assertEqual(first.tags, {'artist'})
 
         first.lose_connection()
         await wait_for(lambda: second.commands[:1] == ['password'])
@@ -228,8 +234,11 @@ class RuntimeTestCase(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(task, TIMEOUT)
 
         fake2 = FakeMPD(albums(30))
-        await self.start(fake2, raw, store=store)
+        runtime2, _ = await self.start(fake2, raw, store=store)
         await wait_for(lambda: len(fake2.queue) == 3)
+        await wait_for(lambda: not runtime2.state.validating)
+        # Adding the album and checking the picks share one library read.
+        self.assertEqual(fake2.commands.count('search'), 1)
 
     async def test_adds_that_keep_failing_halt(self):
         fake = FakeMPD(library(150))
@@ -302,6 +311,27 @@ class RuntimeTestCase(unittest.IsolatedAsyncioTestCase):
                 first.key not in {e.key for e in runtime.state.jukebox_queue}
             )
         )
+
+    async def test_album_check_with_intact_picks_reads_no_library(self):
+        fake = FakeMPD(albums(30))
+        raw = {'jukebox': {'mode': 'album'}}
+        runtime, _ = await self.start(
+            fake, raw, overrides={'album_check_delay': 0}
+        )
+        await wait_for(lambda: len(runtime.state.jukebox_queue) == 25)
+        await wait_for(lambda: not runtime.state.validating)
+        searches, finds = (
+            fake.commands.count('search'),
+            fake.commands.count('find'),
+        )
+        # An unrelated change: only the picks' songs are looked up.
+        fake.library.append(track('new/1.mp3', artist='N', album='New'))
+        fake.notify('database')
+        await wait_for(lambda: fake.commands.count('find') > finds)
+        await wait_for(lambda: not runtime.state.validating)
+        self.assertEqual(fake.commands.count('search'), searches)
+        self.assertEqual(len(runtime.state.jukebox_queue), 25)
+        self.assertFalse(runtime.refiller.albums_current)
 
     async def test_include_filter_and_playlist_sources(self):
         lib = library(150) + [
@@ -520,3 +550,54 @@ class _NoHistory:
 
     async def history(self):
         return ()
+
+
+class AlbumIndexTestCase(unittest.IsolatedAsyncioTestCase):
+    def refiller(self):
+        return Refiller(
+            parse_config({'jukebox': {'mode': 'album'}}), _NoHistory()
+        )
+
+    async def test_built_once_per_generation(self):
+        fake = FakeMPD(albums(5))
+        refiller = self.refiller()
+        io = MpdIO(fake)
+        first, second = await asyncio.gather(
+            refiller.album_index(io), refiller.album_index(io)
+        )
+        self.assertIs(first, second)
+        self.assertIs(await refiller.album_index(io), first)
+        self.assertEqual(fake.commands.count('search'), 1)
+        refiller.invalidate()
+        self.assertFalse(refiller.albums_current)
+        await refiller.album_index(io)
+        self.assertEqual(fake.commands.count('search'), 2)
+
+    async def test_failed_build_is_retried(self):
+        class Flaky(FakeMPD):
+            fail = True
+
+            async def search(self, *args):
+                if self.fail:
+                    self.fail = False
+                    raise error(52, 'search', 'busy')
+                return await super().search(*args)
+
+        refiller = self.refiller()
+        io = MpdIO(Flaky(albums(2)))
+        with self.assertRaises(CommandError):
+            await refiller.album_index(io)
+        self.assertEqual(len(await refiller.album_index(io)), 2)
+
+    async def test_cancelled_build(self):
+        refiller = self.refiller()
+        refiller.cancel_build()
+        task = asyncio.create_task(
+            refiller.album_index(MpdIO(FakeMPD(albums(2))))
+        )
+        await asyncio.sleep(0)
+        refiller.cancel_build()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        index = await refiller.album_index(MpdIO(FakeMPD(albums(2))))
+        self.assertEqual(len(index), 2)

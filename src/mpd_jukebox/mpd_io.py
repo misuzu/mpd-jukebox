@@ -153,6 +153,20 @@ class MpdIO:
             check_fatal(e)
             raise
 
+    async def restrict_tags(self, tags: frozenset[str] | None) -> None:
+        """Ask MPD to send only these tags on this connection (`tagtypes`,
+        MPD 0.21); None keeps all. File names, durations and dates are
+        always sent."""
+        if tags is None:
+            return
+        try:
+            await self.client.tagtypes('clear')
+            if tags:
+                await self.client.tagtypes('enable', *sorted(tags))
+        except CommandError as e:
+            check_fatal(e)
+            log.info('MPD cannot limit the tags it sends (%s)', e)
+
     async def status(self) -> Status:
         status = await self.client.status()
         current = (

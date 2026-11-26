@@ -293,6 +293,17 @@ def predicate(
     return check
 
 
+def tags_used(flt: Filter) -> frozenset[str] | None:
+    """The tags a filter reads; None if it can read any tag (`any`)."""
+    tags = set()
+    for clause in flt.clauses:
+        if clause.kind is Kind.ANY:
+            return None
+        if clause.tag is not None:
+            tags.add(clause.tag)
+    return frozenset(tags)
+
+
 def usable(result: ParseResult) -> Filter | None:
     """The filter to apply: myMPD ignores invalid expressions."""
     return result if isinstance(result, Filter) else None

@@ -8,6 +8,7 @@ from mpd.base import ConnectionError as MpdConnectionError
 
 from mpd_jukebox import filters
 from mpd_jukebox.mpd_io import song_from_mpd
+from mpd_jukebox.tags import MPD_TAGS
 
 
 def error(code: int, command: str, message: str) -> CommandError:
@@ -43,6 +44,8 @@ class FakeMPD:
         self.fail_add: set[str] = set()
         self.connected = True
         self._idle: asyncio.Queue[Any] = asyncio.Queue()
+        # Tags sent to the client (`tagtypes`); None for all.
+        self.tags: set[str] | None = None
 
     # -- helpers for tests -----------------------------------------------------
 
@@ -65,6 +68,25 @@ class FakeMPD:
         return [s['file'] for s in self.queue]
 
     # -- MPD commands -----------------------------------------------------------
+
+    def _out(self, song: dict[str, Any]) -> dict[str, Any]:
+        """A song as sent to the client: only the enabled tags."""
+        if self.tags is None:
+            return dict(song)
+        return {
+            k: v
+            for k, v in song.items()
+            if k not in MPD_TAGS or k in self.tags
+        }
+
+    async def tagtypes(self, *args: str) -> list[str]:
+        self._command('tagtypes')
+        if args[0] == 'clear':
+            self.tags = set()
+        elif args[0] == 'enable':
+            assert self.tags is not None
+            self.tags |= {a.lower() for a in args[1:]}
+        return []
 
     def _command(self, name: str) -> None:
         if not self.connected:
@@ -97,17 +119,17 @@ class FakeMPD:
 
     async def currentsong(self) -> dict[str, Any]:
         self._command('currentsong')
-        return {} if self.pos is None else dict(self.queue[self.pos])
+        return {} if self.pos is None else self._out(self.queue[self.pos])
 
     async def playlistinfo(self) -> list[dict[str, Any]]:
         self._command('playlistinfo')
-        return [dict(s) for s in self.queue]
+        return [self._out(s) for s in self.queue]
 
     async def lsinfo(self, uri: str) -> list[dict[str, Any]]:
         self._command('lsinfo')
         for s in self.library:
             if s['file'] == uri:
-                return [dict(s)]
+                return [self._out(s)]
         raise error(50, 'lsinfo', 'No such directory')
 
     def _window(self, items: list[Any], args: tuple[str, ...]) -> list[Any]:
@@ -131,19 +153,19 @@ class FakeMPD:
                 subject = filters.Subject(song.tags, song.uri, song.prio)
                 if filters.evaluate(parsed, subject):
                     found.append(obj)
-        return [dict(s) for s in self._window(found, args)]
+        return [self._out(s) for s in self._window(found, args)]
 
     async def find(self, tag: str, value: str) -> list[dict[str, Any]]:
         self._command('find')
         assert tag == 'file'
-        return [dict(s) for s in self.library if s['file'] == value]
+        return [self._out(s) for s in self.library if s['file'] == value]
 
     async def listplaylistinfo(self, name: str, *args: str):
         self._command('listplaylistinfo')
         if name not in self.playlists:
             raise error(50, 'listplaylistinfo', 'No such playlist')
         by_uri = {s['file']: s for s in self.library}
-        songs = [dict(by_uri[u]) for u in self.playlists[name]]
+        songs = [self._out(by_uri[u]) for u in self.playlists[name]]
         if args:
             start, end = (int(x) for x in args[0].split(':'))
             return songs[start:end]

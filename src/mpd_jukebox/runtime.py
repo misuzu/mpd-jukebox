@@ -22,10 +22,11 @@ from .constraints import (
     history_wanted,
     last_played_map,
     make_context,
+    needed_tags,
     song_candidate,
     uniq_context,
 )
-from .model import DATABASE, Album, Config, Mode, Song
+from .model import DATABASE, Album, Config, Entry, Mode, Song
 from .mpd_io import WINDOW, FatalMpdError, MpdIO, check_fatal
 from .select import (
     Filled,
@@ -66,6 +67,18 @@ async def connect_client(connection: Connection) -> Any:
     return client
 
 
+async def prepare(
+    io: MpdIO, settings: Settings, connection: Connection
+) -> None:
+    """Set up a new connection: authenticate first, then ask MPD for only
+    the tags this configuration reads."""
+    if connection.password is not None:
+        await io.password(connection.password)
+    await io.restrict_tags(
+        needed_tags(settings.config, settings.include, settings.exclude)
+    )
+
+
 def random_seed() -> int:
     return secrets.randbits(64)
 
@@ -101,7 +114,30 @@ class Refiller:
         self.settings = settings
         self.store = store
         self.seed = seed
+        # The last album index built, possibly for an older database.
         self.albums: Mapping[str, Album] | None = None
+        # Raised whenever MPD's database may have changed.
+        self.generation = 0
+        self._albums_generation = -1
+        self._building: asyncio.Task[Mapping[str, Album]] | None = None
+        self._building_generation = -1
+
+    def invalidate(self) -> None:
+        """MPD's database (may have) changed: the album index is stale."""
+        self.generation += 1
+
+    @property
+    def albums_current(self) -> bool:
+        return (
+            self.albums is not None
+            and self._albums_generation == self.generation
+        )
+
+    def cancel_build(self) -> None:
+        """Abandon an index build, e.g. because the connection is gone."""
+        if self._building is not None:
+            self._building.cancel()
+            self._building = None
 
     async def refill(
         self, io: MpdIO, effect: core.StartRefill, now: int
@@ -180,6 +216,24 @@ class Refiller:
                 return acc
 
     async def album_index(self, io: MpdIO) -> Mapping[str, Album]:
+        """The album index of the current database. It is built (a full
+        library read) at most once per database generation, and callers
+        that ask while it is being built share that build."""
+        if self.albums_current:
+            assert self.albums is not None
+            return self.albums
+        task = self._building
+        if (
+            task is None
+            or self._building_generation != self.generation
+            or (task.done() and (task.cancelled() or task.exception()))
+        ):
+            task = asyncio.create_task(self._build(io, self.generation))
+            self._building = task
+            self._building_generation = self.generation
+        return await asyncio.shield(task)
+
+    async def _build(self, io: MpdIO, generation: int) -> Mapping[str, Album]:
         songs: list[Song] = []
         start = 0
         while True:
@@ -188,8 +242,11 @@ class Refiller:
             if len(batch) < WINDOW:
                 break
             start += WINDOW
-        self.albums = build_albums(songs, self.settings.config.albums)
-        return self.albums
+        index = build_albums(songs, self.settings.config.albums)
+        if generation >= self._albums_generation:
+            self.albums = index
+            self._albums_generation = generation
+        return index
 
 
 _STOP = object()
@@ -282,12 +339,11 @@ class Runtime:
 
     async def _open(self) -> Any:
         client = await self._connect(self.connection)
-        if self.connection.password is not None:
-            try:
-                await MpdIO(client).password(self.connection.password)
-            except BaseException:
-                client.disconnect()
-                raise
+        try:
+            await prepare(MpdIO(client), self.settings, self.connection)
+        except BaseException:
+            client.disconnect()
+            raise
         log.info('Connected to MPD at %s', self.connection.describe())
         return client
 
@@ -304,6 +360,8 @@ class Runtime:
     async def _session(self, client: Any) -> None:
         io = MpdIO(client)
         self._drain()
+        # The database may have changed while we were not connected.
+        self.refiller.invalidate()
         self._spawn(self._idle(client, io))
         self._events.put_nowait(core.Connected(await io.status(), self.now()))
         while True:
@@ -338,6 +396,7 @@ class Runtime:
         self._timers.clear()
         for task in tuple(self._tasks):
             task.cancel()
+        self.refiller.cancel_build()
         self._refill_task = None
 
     # -- event sources --------------------------------------------------------
@@ -351,6 +410,7 @@ class Runtime:
             if 'player' in changed:
                 self._events.put_nowait(core.PlayerChanged(status, now))
             if 'database' in changed:
+                self.refiller.invalidate()
                 self._events.put_nowait(core.DatabaseChanged(now))
 
     def _fire(self, name: str, io: MpdIO) -> None:
@@ -368,9 +428,50 @@ class Runtime:
                 e.key for e in effect.entries if not await io.exists(e.key)
             ]
         else:
-            albums = await self.refiller.album_index(io)
-            missing = [e.key for e in effect.entries if e.key not in albums]
+            missing = await self._missing_albums(io, effect.entries)
         self._events.put_nowait(core.Validated(frozenset(missing), self.now()))
+
+    async def _missing_albums(
+        self, io: MpdIO, entries: tuple[Entry, ...]
+    ) -> list[str]:
+        """Album picks that left the database. With a current index this is
+        a lookup. Otherwise the songs of each pick are checked against MPD
+        (a few hundred small queries); only if a picked album changed, or is
+        not in the cached index, is the index rebuilt (a full library
+        read)."""
+        index = self.refiller.albums
+        if not self.refiller.albums_current and (
+            index is None or not await self._albums_intact(io, index, entries)
+        ):
+            index = await self.refiller.album_index(io)
+        assert index is not None
+        return [e.key for e in entries if e.key not in index]
+
+    async def _albums_intact(
+        self,
+        io: MpdIO,
+        index: Mapping[str, Album],
+        entries: tuple[Entry, ...],
+    ) -> bool:
+        for entry in entries:
+            album = index.get(entry.key)
+            if album is None:
+                return False
+            for uri in album.uris:
+                if not await io.exists(uri):
+                    return False
+        return True
+
+    async def _enqueue_and_report(
+        self, io: MpdIO, effect: core.Enqueue
+    ) -> None:
+        added = await self._enqueue(io, effect)
+        status = await io.status()
+        self._events.put_nowait(
+            core.Enqueued(
+                len(effect.entries), added, effect.wanted, status, self.now()
+            )
+        )
 
     async def _refill(self, io: MpdIO, effect: core.StartRefill) -> None:
         try:
@@ -390,14 +491,10 @@ class Runtime:
                 assert self._refill_task is None or self._refill_task.done()
                 log.info('Filling jukebox queue')
                 self._refill_task = self._spawn(self._refill(io, effect))
-            case core.Enqueue(_, entries, wanted):
-                added = await self._enqueue(io, effect)
-                status = await io.status()
-                self._events.put_nowait(
-                    core.Enqueued(
-                        len(entries), added, wanted, status, self.now()
-                    )
-                )
+            case core.Enqueue():
+                # In the background: in album mode it may wait for the album
+                # index, and events must keep flowing meanwhile.
+                self._spawn(self._enqueue_and_report(io, effect))
             case core.Validate():
                 self._spawn(self._validate(io, effect))
             case core.Play():

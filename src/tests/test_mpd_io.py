@@ -115,6 +115,30 @@ class MpdIOTestCase(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(FatalMpdError):
             await MpdIO(FakeMPD([], password='pw')).exists('a')
 
+    async def test_restrict_tags(self):
+        fake = FakeMPD([track('a.mp3', artist='A', album='B')])
+        io = MpdIO(fake)
+        await io.restrict_tags(None)
+        self.assertEqual(fake.commands, [])
+        await io.restrict_tags(frozenset({'album'}))
+        self.assertEqual(fake.tags, {'album'})
+        (song,) = await fake.search('file', '')
+        self.assertEqual(set(song), {'file', 'duration', 'album'})
+        await io.restrict_tags(frozenset())
+        self.assertEqual(fake.tags, set())
+
+    async def test_restrict_tags_unsupported(self):
+        class Old(FakeMPD):
+            async def tagtypes(self, *args):
+                raise error(2, 'tagtypes', 'Unknown sub command')
+
+        with self.assertLogs('mpd_jukebox.mpd_io', 'INFO'):
+            await MpdIO(Old([])).restrict_tags(frozenset({'artist'}))
+        with self.assertRaises(FatalMpdError):
+            await MpdIO(FakeMPD([], password='pw')).restrict_tags(
+                frozenset({'artist'})
+            )
+
     async def test_stickers_unavailable(self):
         io = MpdIO(FakeMPD([], stickers=False))
         self.assertIsNone(await io.stickers('like'))

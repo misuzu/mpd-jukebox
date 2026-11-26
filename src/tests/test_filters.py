@@ -152,3 +152,25 @@ class PredicateTestCase(unittest.TestCase):
         self.assertFalse(check(self.rock))
         check = filters.predicate(None, self.flt("(Artist == 'a')"))
         self.assertTrue(check(self.pop))
+
+
+class TagsUsedTestCase(unittest.TestCase):
+    def tags(self, expression):
+        result = filters.parse(expression)
+        assert isinstance(result, Filter)
+        return filters.tags_used(result)
+
+    def test_tags(self):
+        self.assertEqual(
+            self.tags("((Genre == 'x') AND (AlbumArtist != 'y'))"),
+            {'genre', 'albumartist'},
+        )
+
+    def test_special_clauses_need_no_tags(self):
+        self.assertEqual(
+            self.tags("((file == 'a') AND (base 'b') AND (prio >= 1))"),
+            frozenset(),
+        )
+
+    def test_any_needs_every_tag(self):
+        self.assertIsNone(self.tags("((Genre == 'x') AND (any == 'y'))"))

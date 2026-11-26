@@ -10,6 +10,7 @@ from mpd_jukebox.constraints import (
     history_wanted,
     last_played_map,
     make_context,
+    needed_tags,
     played_before,
     song_candidate,
     uniq_context,
@@ -217,3 +218,42 @@ class SelectTestCase(unittest.TestCase):
         self.assertTrue(more_windows(full, 10_000))
         short = replace(acc, lineno=9_000)
         self.assertFalse(more_windows(short, 10_000))
+
+
+class NeededTagsTestCase(unittest.TestCase):
+    def test_song_mode(self):
+        self.assertEqual(needed_tags(Config(), None, None), {'artist'})
+
+    def test_title_falls_back_to_name(self):
+        cfg = Config(uniq_tag='title')
+        self.assertEqual(needed_tags(cfg, None, None), {'title', 'name'})
+
+    def test_album_mode(self):
+        cfg = Config(mode=Mode.ALBUM, uniq_tag='genre')
+        self.assertEqual(
+            needed_tags(cfg, None, None),
+            {
+                'genre',
+                'albumartist',
+                'artist',
+                'album',
+                'disc',
+                'track',
+                'musicbrainz_albumid',
+            },
+        )
+        cfg = Config(
+            mode=Mode.ALBUM,
+            albums=AlbumSettings(group_tag='date', use_mbid=False),
+        )
+        tags = needed_tags(cfg, None, None)
+        assert tags is not None
+        self.assertIn('date', tags)
+        self.assertNotIn('musicbrainz_albumid', tags)
+
+    def test_filters(self):
+        tags = needed_tags(
+            Config(), flt("(Genre == 'x')"), flt("(Composer == 'y')")
+        )
+        self.assertEqual(tags, {'artist', 'genre', 'composer'})
+        self.assertIsNone(needed_tags(Config(), None, flt("(any == 'y')")))

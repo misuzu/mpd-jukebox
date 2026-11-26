@@ -4,7 +4,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
-from .filters import Filter, Subject, predicate
+from .filters import Filter, Subject, predicate, tags_used
 from .model import Album, AlbumSettings, Config, Mode, Song
 from .tags import album_key, tag_value
 
@@ -53,6 +53,31 @@ def make_context(
         hated=hated,
         matches=predicate(include, exclude),
     )
+
+
+def needed_tags(
+    cfg: Config, include: Filter | None, exclude: Filter | None
+) -> frozenset[str] | None:
+    """The tags the jukebox reads from MPD with this configuration, or None
+    for all of them (a filter using `any`). Asking MPD for only these
+    (`tagtypes`) makes library reads much smaller."""
+    tags = {cfg.uniq_tag}
+    if cfg.uniq_tag == 'title':
+        tags.add('name')  # the title falls back to it (tag_value)
+    if cfg.mode is Mode.ALBUM:
+        # Album keys (album_key) and the order of an album's songs.
+        tags |= {'albumartist', 'artist', 'album', 'disc', 'track'}
+        if cfg.albums.use_mbid:
+            tags.add('musicbrainz_albumid')
+        if cfg.albums.group_tag is not None:
+            tags.add(cfg.albums.group_tag)
+    for flt in (include, exclude):
+        if flt is not None:
+            used = tags_used(flt)
+            if used is None:
+                return None
+            tags |= used
+    return frozenset(tags)
 
 
 def duration_ok(duration: float, min_s: int, max_s: int) -> bool:
