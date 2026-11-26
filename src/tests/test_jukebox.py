@@ -391,20 +391,11 @@ class ValidationTestCase(unittest.TestCase):
         state, _ = update(CFG, state, Validated(frozenset(), NOW))
         self.assertFalse(state.revalidate)
 
-    def test_album_mode_waits_for_a_quiet_database(self):
-        cfg = replace(CFG, mode=Mode.ALBUM, album_check_delay=30)
+    def test_album_mode_checks_right_away(self):
+        cfg = replace(CFG, mode=Mode.ALBUM)
         state = State(jukebox_queue=entries(20))
         state, effects = update(cfg, state, DatabaseChanged(NOW))
-        self.assertEqual(effects, (SetTimer(core.VALIDATE_TIMER, 30),))
-        self.assertFalse(state.validating)
-        # Another change pushes the timer back (SetTimer replaces it).
-        _, effects = update(cfg, state, DatabaseChanged(NOW + 5))
-        self.assertEqual(effects, (SetTimer(core.VALIDATE_TIMER, 30),))
-        event = TimerFired(core.VALIDATE_TIMER, PLAYING, NOW + 35)
-        state, effects = update(cfg, state, event)
-        self.assertEqual(
-            of_type(effects, Validate), [Validate(Mode.ALBUM, entries(20))]
-        )
+        self.assertEqual(effects, (Validate(Mode.ALBUM, entries(20)),))
         self.assertTrue(state.validating)
 
     def test_change_during_a_refill_checks_its_picks(self):

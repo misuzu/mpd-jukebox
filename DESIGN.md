@@ -301,7 +301,6 @@ Config(mode, playlist, queue_length, last_played_hours, uniq_tag, ignore_hated,
        queue_length_song, queue_length_song_min,
        queue_length_album, queue_length_album_min,
        add_max, uniq_range, add_offset, last_played_count, write_stickers,
-       album_check_delay,               # not in TOML; tests set it to 0
        albums: AlbumSettings)
 
 State(jukebox_queue: tuple[Entry, ...],
@@ -326,7 +325,7 @@ in the journal.
 Connected(status, now)
 QueueChanged(status, now)            # idle "playlist"
 PlayerChanged(status, now)           # idle "player"
-TimerFired(name: 'jukebox'|'scrobble'|'validate', status, now)   # the shell fetches a fresh status
+TimerFired(name: 'jukebox'|'scrobble', status, now)   # the shell fetches a fresh status
 RefillDone(entries: tuple[Entry, ...], add: int, now)
 RefillFailed(error: str, now)
 Enqueued(attempted, added, wanted, status, now)   # result of an Enqueue effect
@@ -382,7 +381,8 @@ reference for those.
   treated as "no filter", as in myMPD) or `Unsupported` (fuzzy `~~`, which
   `parse_config` turns into a `ConfigError`). `evaluate(filter, subject)`
   checks a song or album, and `predicate(include, exclude)` combines the two
-  filters, with exclude winning.
+  filters, with exclude winning. `tags_used` lists the tags a filter reads
+  (none for `any`, which reads them all), for `needed_tags`.
 
 ### 4.4 Randomness
 
@@ -424,9 +424,10 @@ the `lastPlayed` stickers of 8,400 played songs, about 380 bytes per
   queries for 25 albums); only if a picked album changed, or is missing
   from the cached index, is the index rebuilt. A database update that does
   not touch the picks therefore costs some 100 KB instead of a library
-  read. Album mode still waits for `album_check_delay` (30) seconds of
-  quiet before checking (§5.1), which keeps bursts of updates down to one
-  check.
+  read, so album mode checks right after every update, like song mode.
+  After a rebuild the next check starts from a fresh index again, so a
+  burst of updates reads the library more than once only if it keeps
+  moving picked albums.
 - The reservoir is small (at most about 1100 entries). It is held as a
   tuple and replaced with a new tuple on each change, which costs O(k) per
   accepted candidate; accepted candidates are rare once it is full.
@@ -459,11 +460,15 @@ keep the jukebox queue consistent.
   and only then does the core decide whether more entries are needed (failed
   adds, §5.1) or whether to top up. A second run in between could act on a
   status from before the first `Enqueue` finished.
-- **Database checks may overlap anything but refills and other checks.**
-  `Validated` removes entries by key from the jukebox queue as it is *then*,
-  so entries taken or added while the check ran are handled correctly. A
-  refill's picks may come from a database that is being updated, so a check
-  deferred by a refill runs right after `RefillDone`.
+- **Database checks run alongside everything else, but never two at a
+  time.** `Validated` removes entries by key from the jukebox queue as it is
+  *then*, so entries taken or added while the check ran are handled
+  correctly. Refills are the special case, because `RefillDone` replaces
+  the jukebox queue with a snapshot: a check is not started during a
+  refill but deferred until `RefillDone`, and a check that was already
+  running and finishes during a refill is repeated after `RefillDone`, so
+  entries it removed cannot come back. Either way, a refill's picks, which
+  may come from a database being updated, are checked too.
 - **`Connected` starts over.** The shell cancels its background tasks and
   drops their pending events when a connection ends, so `Connected` clears
   `filling`, `enqueuing` and `validating`, and checks the jukebox queue
@@ -477,62 +482,73 @@ keep the jukebox queue consistent.
 
 ### 5.1 Runtime (`runtime.py`)
 
+**Connection.**
+
 - One python-mpd2 `mpd.asyncio.MPDClient` connection. A background task
   iterates `idle(['playlist', 'player', 'database'])`. python-mpd2's asyncio
   client sends `noidle` by itself whenever another command is issued, and
   resumes idling afterwards, so a second connection is not needed.
-- An `asyncio.Queue[Event]` collects events from the idle listener, the timers
-  (`loop.call_later` handles keyed by name; `SetTimer` replaces an existing
-  timer), the refill and database-check tasks, and the results of `Enqueue`.
-- At most one refill task runs at a time. The core enforces this with
-  `filling`, and the shell asserts it as well.
-- The main loop is `state, effs = update(cfg, state, ev)`, then each effect is
-  interpreted in order. `Enqueue` produces `Enqueued`. Failures of individual
-  `add` commands are logged as warnings, and the counts are reported.
-- **Failed adds** (§1.5). As in myMPD, entries that cannot be added are
-  replaced by the next ones until `wanted` entries are in MPD's queue. The
-  core takes the replacements from the jukebox queue in further `Enqueue`
-  rounds; if the jukebox queue runs out, it refills with the number still
-  missing. If adds fail `queue_length_song` (or `queue_length_album`) times
-  in a row, the jukebox halts instead of churning through picks forever.
-- **Database changes** (§7.1). On idle `database`, and on every connect, the
-  core asks the shell to `Validate` the jukebox queue. In album mode, idle
-  `database` only (re)arms the `validate` timer, so the check runs once the
-  database has been quiet for `album_check_delay` seconds (§4.5). A
-  background task checks each entry: `find file <uri>` in song mode. In
-  album mode, a current index is enough; otherwise the songs of each
-  picked album are looked up, and the index is rebuilt only if a picked
-  album changed (§4.5). The core then drops the
-  missing entries, persists the rest and tops up if needed. A change during
-  a check or a refill leads to another check once it finishes, so picks made
-  from a database that was being updated are checked too.
-- **Connection set-up** (`prepare`, also used by `select`): `password`
-  first if one is configured (§5.5), then `tagtypes` to ask for only the
-  tags in use (§4.5).
-- **`Enqueue` runs as a background task**, like refills and checks: in album
-  mode it may have to wait for the album index, and events must keep
-  flowing meanwhile. The core's `enqueuing` flag keeps it to one at a time
-  (§4.6).
-- **The album index** lives in `Refiller` with the database generation it
-  was built for. Idle `database` and every new connection raise the
-  generation; a build in progress is shared by all callers and cancelled
-  when the connection ends.
-- A failure in a background task (idle listener, timer, refill, database
-  check) is forwarded to the main loop. Connection errors end the session
-  and lead to a reconnect, as do unexpected MPD errors. Password and
-  permission errors end the program (§5.5). A refill is the exception: any
-  other error during a refill, such as MPD rejecting the include filter,
-  becomes `RefillFailed` and halts the jukebox.
+- Set-up (`prepare`, also used by `select`): `password` first if one is
+  configured (§5.5), then `tagtypes` to ask for only the tags in use (§4.5).
+
+**Events and tasks.**
+
+- The main loop is `state, effs = update(cfg, state, ev)`, then each effect
+  is interpreted in order, before the next event.
+- An `asyncio.Queue[Event]` collects events from the idle listener, the
+  timers (`loop.call_later` handles keyed by name; `SetTimer` replaces an
+  existing timer) and the background tasks.
+- Three effects run as background tasks, so that events keep flowing while
+  they wait on MPD: `StartRefill` (ends with `RefillDone` or
+  `RefillFailed`), `Enqueue` (ends with `Enqueued`; in album mode it may
+  wait for the album index) and `Validate` (ends with `Validated`). The
+  core's flags keep each to one at a time (§4.6); for refills the shell
+  asserts it as well.
+
+**Failed adds** (§1.5). As in myMPD, entries that cannot be added are
+replaced by the next ones until `wanted` entries are in MPD's queue.
+Failures of individual `add` commands are logged as warnings. The core takes
+the replacements from the jukebox queue in further `Enqueue` rounds; if the
+jukebox queue runs out, it refills with the number still missing. If adds
+fail `queue_length_song` (or `queue_length_album`) times in a row, the
+jukebox halts instead of churning through picks forever.
+
+**Database changes and the album index** (§7.1).
+
+- On idle `database`, and on every connect, the core asks the shell to
+  `Validate` the jukebox queue, in both modes. In song mode the task runs
+  `find file <uri>` for each pick. In album mode a current album index is
+  enough; otherwise the songs of each picked album are looked up, and the
+  index is rebuilt only if a picked album changed (§4.5). The core then
+  drops the missing entries, persists the rest and tops up if needed.
+- The album index lives in `Refiller` with the database generation it was
+  built for. Idle `database` and every new connection raise the
+  generation. A build is shared by all callers that need the index while it
+  runs, is retried after a failure, and is cancelled when the connection
+  ends.
+
+**Errors and reconnects.**
+
+- A failure in a background task (idle listener, timer, refill, add,
+  database check, album-index build) is forwarded to the main loop.
+  Connection errors end the session and lead to a reconnect, as do
+  unexpected MPD errors. Password and permission errors end the program
+  (§5.5). A refill is the exception: any other error during a refill, such
+  as MPD rejecting the include filter, becomes `RefillFailed` and halts the
+  jukebox.
 - Reconnect uses exponential backoff. On every connect and reconnect a
   `Connected` event is emitted, and the core treats it like a queue change:
   the jukebox runs if MPD's queue is shorter than `queue_length`. Background
   tasks of the old connection are cancelled and their pending events
   dropped, and `Connected` resets `filling`, `enqueuing` and `validating`
   (§4.6).
-- On SIGHUP: emit `Restart`. This is how to resume after a failed refill
+
+**Signals.**
+
+- SIGHUP emits `Restart`. This is how to resume after a failed refill
   halted the jukebox (§7.2), without restarting the process.
-- On SIGINT/SIGTERM: cancel tasks, disconnect and exit with status 0. Every
-  store write is its own transaction, so there is nothing to flush.
+- SIGINT and SIGTERM cancel the tasks, disconnect and exit with status 0.
+  Every store write is its own transaction, so there is nothing to flush.
 
 ### 5.2 MPD I/O (`mpd_io.py`)
 
@@ -550,7 +566,10 @@ keep the jukebox queue consistent.
   `Refiller` per database generation (§5.1). Adding an album uses the
   cached index, even a stale one, as long as it has the album; otherwise
   the index is rebuilt once. A stale index can lack songs added to an
-  album since; they are picked up at the next rebuild.
+  album since; they are picked up at the next rebuild. It can also still
+  list songs that were moved, in the short time between a database update
+  and the check that follows it; adding such an album then fails or comes
+  out partial, and the next pick takes its place (failed adds, §5.1).
 - Stickers: `sticker find song "" lastPlayed` and `sticker find song "" like`
   become immutable `Mapping[uri, str]`. If stickers are unavailable (MPD
   answers "unknown command" or there is no sticker DB), the result is `None`,
@@ -909,13 +928,13 @@ same suite, and `nix flake check` adds the VM test of §5.7.
     entries, a run with no entries left refills, and endless failures halt;
     `filling` and `enqueuing` block other runs; database checks drop missing
     entries and are repeated after a change during a check or refill, and
-    after a check that finished during a refill; album mode waits for a
-    quiet database;
+    after a check that finished during a refill;
   - the selection fold with fixed seeds: deterministic, uniqueness never
     broken over many seeds, pre-existing entries never touched, a short
     result is a failure;
-  - filter parsing and evaluation, following myMPD's semantics; album keys
-    with and without MBID; tag helpers and normalisation.
+  - filter parsing and evaluation, following myMPD's semantics; the tags a
+    filter and a configuration need (`tags_used`, `needed_tags`); album
+    keys with and without MBID; tag helpers and normalisation.
 - **Shell.** A fake MPD client (`tests/fake_mpd.py`, an in-memory object
   with the same async methods) and a temporary SQLite file. The runtime is
   tested end to end against it. It honours `tagtypes`, so the tests also

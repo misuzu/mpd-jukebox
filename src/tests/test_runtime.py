@@ -66,7 +66,6 @@ class RuntimeTestCase(unittest.IsolatedAsyncioTestCase):
         raw=None,
         connection=None,
         store=None,
-        overrides=None,
     ) -> tuple[Runtime, asyncio.Task]:
         """Run a Runtime against FakeMPD instances, one per connect."""
         queue = list(fakes) if isinstance(fakes, list) else [fakes]
@@ -78,12 +77,8 @@ class RuntimeTestCase(unittest.IsolatedAsyncioTestCase):
             fake.connected = True
             return fake
 
-        settings = parse_config(raw or {})
-        if overrides:
-            config = replace(settings.config, **overrides)
-            settings = replace(settings, config=config)
         runtime = Runtime(
-            settings,
+            parse_config(raw or {}),
             connection or Connection(),
             store or await self.store(),
             connect=connect,
@@ -295,9 +290,7 @@ class RuntimeTestCase(unittest.IsolatedAsyncioTestCase):
     async def test_database_change_in_album_mode(self):
         fake = FakeMPD(albums(30))
         raw = {'jukebox': {'mode': 'album'}}
-        runtime, _ = await self.start(
-            fake, raw, overrides={'album_check_delay': 0}
-        )
+        runtime, _ = await self.start(fake, raw)
         await wait_for(lambda: len(runtime.state.jukebox_queue) == 25)
         await wait_for(lambda: not runtime.state.validating)
         first = runtime.state.jukebox_queue[0]
@@ -315,9 +308,7 @@ class RuntimeTestCase(unittest.IsolatedAsyncioTestCase):
     async def test_album_check_with_intact_picks_reads_no_library(self):
         fake = FakeMPD(albums(30))
         raw = {'jukebox': {'mode': 'album'}}
-        runtime, _ = await self.start(
-            fake, raw, overrides={'album_check_delay': 0}
-        )
+        runtime, _ = await self.start(fake, raw)
         await wait_for(lambda: len(runtime.state.jukebox_queue) == 25)
         await wait_for(lambda: not runtime.state.validating)
         searches, finds = (
