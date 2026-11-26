@@ -41,7 +41,10 @@
         {
           default = pkgs.mkShell {
             inputsFrom = [ pkgs.mpd-jukebox ];
-            packages = [ pkgs.npins ];
+            packages = with pkgs; [
+              nixfmt
+              npins
+            ];
           };
         }
       );

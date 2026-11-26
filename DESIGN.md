@@ -19,7 +19,9 @@ myMPD and what we keep on purpose.
 
 ## 1. myMPD jukebox behaviour (reference)
 
-Source paths are relative to `mympd/src`.
+Described from myMPD commit `aa6f5936306693314bf0ab786c9e9a7aeaf5483d`
+(2026-11-23, `v26.1.3-4`) of https://github.com/jcorporation/myMPD. Source
+paths are relative to its `src/`.
 
 ### 1.1 Modes and settings
 
