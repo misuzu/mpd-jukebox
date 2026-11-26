@@ -207,12 +207,22 @@ class MpdIO:
             return None
         return stickers_from_mpd(found, name)
 
+    async def exists(self, uri: str) -> bool:
+        """Whether MPD's database has this song. Errors other than fatal
+        ones count as "exists", so nothing is dropped by mistake."""
+        try:
+            return bool(await self.client.find('file', uri))
+        except CommandError as e:
+            check_fatal(e)
+            log.warning('Checking %s failed: %s', uri, e)
+            return True
+
     async def add(self, uri: str) -> bool:
         try:
             await self.client.add(uri)
         except CommandError as e:
             check_fatal(e)
-            log.error('Adding %s to the queue failed: %s', uri, e)
+            log.warning('Adding %s failed, skipping it: %s', uri, e)
             return False
         log.info('Jukebox adding song: %s', uri)
         return True

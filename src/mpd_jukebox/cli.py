@@ -181,7 +181,9 @@ def check(options: Options) -> None:
 @click.pass_obj
 def list_(options: Options) -> None:
     """Print the saved jukebox queue."""
-    loaded = load(options)
+    # Needs no MPD connection, so no password file either: it may only
+    # exist while the service runs (a systemd credential).
+    loaded = load(options, read_secrets=False)
     if not os.path.exists(loaded.state_file):
         raise click.ClickException(f'{loaded.state_file} does not exist')
     run_async(_list(loaded.state_file))

@@ -100,6 +100,21 @@ class MpdIOTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(song)
         self.assertIsNone(await io.song('missing.mp3'))
 
+    async def test_exists(self):
+        io = MpdIO(FakeMPD([track('a.cue/track0001')]))
+        self.assertTrue(await io.exists('a.cue/track0001'))
+        self.assertFalse(await io.exists('a.cue/track0002'))
+
+    async def test_exists_errors(self):
+        class Broken(FakeMPD):
+            async def find(self, tag, value):
+                raise error(52, 'find', 'system error')
+
+        with self.assertLogs('mpd_jukebox.mpd_io', 'WARNING'):
+            self.assertTrue(await MpdIO(Broken([])).exists('a'))
+        with self.assertRaises(FatalMpdError):
+            await MpdIO(FakeMPD([], password='pw')).exists('a')
+
     async def test_stickers_unavailable(self):
         io = MpdIO(FakeMPD([], stickers=False))
         self.assertIsNone(await io.stickers('like'))

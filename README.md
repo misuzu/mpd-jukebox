@@ -51,8 +51,12 @@ filters.
 ### Signals
 
 - `SIGHUP` restarts the jukebox: it forgets the songs it picked in advance
-  and picks again. Use it after editing playlists or tags, or to resume a
-  halted jukebox (below).
+  and picks again. Use it to resume a halted jukebox (below), or to make
+  edits to a playlist or tags take effect right away.
+
+Songs removed from the library are dropped from the picks as soon as MPD
+finishes its database update. One that can't be added for another reason is
+skipped, and the next pick takes its place.
 - `SIGINT` and `SIGTERM` stop it.
 
 When a refill can't find enough songs (100 in song mode, 25 albums in album

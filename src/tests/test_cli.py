@@ -119,6 +119,10 @@ class CliTestCase(unittest.TestCase):
         result = self.invoke(['list'])
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertEqual(result.output, '0\ta.mp3\tArtist\n')
+        # The password file is not needed (nor read) for listing.
+        path = self.config('[mpd]\npassword_file = "/nonexistent"\n')
+        result = self.invoke(['--config', path, 'list'])
+        self.assertEqual(result.exit_code, 0, result.output)
 
     def test_list_old_schema(self):
         async def prepare():

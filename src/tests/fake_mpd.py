@@ -133,6 +133,11 @@ class FakeMPD:
                     found.append(obj)
         return [dict(s) for s in self._window(found, args)]
 
+    async def find(self, tag: str, value: str) -> list[dict[str, Any]]:
+        self._command('find')
+        assert tag == 'file'
+        return [dict(s) for s in self.library if s['file'] == value]
+
     async def listplaylistinfo(self, name: str, *args: str):
         self._command('listplaylistinfo')
         if name not in self.playlists:

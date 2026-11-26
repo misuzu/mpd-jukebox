@@ -6,6 +6,7 @@ from mpd_jukebox import jukebox as core
 from mpd_jukebox.jukebox import (
     CancelTimer,
     Connected,
+    DatabaseChanged,
     Enqueue,
     Enqueued,
     Log,
@@ -21,6 +22,8 @@ from mpd_jukebox.jukebox import (
     StartRefill,
     State,
     TimerFired,
+    Validate,
+    Validated,
     update,
 )
 from mpd_jukebox.model import Config, Entry, Mode, PlayState, Status
@@ -119,18 +122,28 @@ class RunTestCase(unittest.TestCase):
         self.assertEqual(of_type(effects, Enqueue), [])
         self.assertEqual(len(of_type(effects, SetTimer)), 2)
 
-    def test_connect_resets_filling(self):
-        state = State(filling=True, jukebox_queue=entries(20))
+    def test_connect_resets_work_and_validates(self):
+        state = State(
+            filling=True,
+            enqueuing=True,
+            validating=True,
+            jukebox_queue=entries(20),
+        )
         state, effects = update(CFG, state, Connected(STOPPED, NOW))
         self.assertFalse(state.filling)
         self.assertEqual(of_type(effects, Enqueue)[0].entries, entries(2))
+        # The rest is checked against the database.
+        self.assertEqual(
+            of_type(effects, Validate), [Validate(Mode.SONG, entries(20)[2:])]
+        )
+        self.assertTrue(state.validating)
 
     def test_queue_change_moves_entries(self):
         state = State(jukebox_queue=entries(20))
         short = replace(PLAYING, queue_length=1)
         state, effects = update(CFG, state, QueueChanged(short, NOW))
         self.assertEqual(state.jukebox_queue, entries(20)[1:])
-        self.assertIn(Enqueue(Mode.SONG, entries(1)), effects)
+        self.assertIn(Enqueue(Mode.SONG, entries(1), 1), effects)
         self.assertIn(Persist(entries(20)[1:]), effects)
 
     def test_queue_change_at_target_does_not_run(self):
@@ -148,7 +161,7 @@ class RunTestCase(unittest.TestCase):
         state = State(jukebox_queue=entries(20), status=PLAYING)
         event = TimerFired(core.JUKEBOX_TIMER, PLAYING, NOW)
         state, effects = update(CFG, state, event)
-        self.assertIn(Enqueue(Mode.SONG, entries(1)), effects)
+        self.assertIn(Enqueue(Mode.SONG, entries(1), 1), effects)
 
     def test_timer_above_target_does_nothing(self):
         long_queue = replace(PLAYING, queue_length=3)
@@ -157,10 +170,15 @@ class RunTestCase(unittest.TestCase):
         state, effects = update(CFG, state, event)
         self.assertEqual(of_type(effects, Enqueue), [])
 
-    def test_filling_and_halted_block_runs(self):
-        for state in (State(filling=True), State(halted=True)):
+    def test_filling_enqueuing_and_halted_block_runs(self):
+        for state in (
+            State(filling=True),
+            State(enqueuing=True, jukebox_queue=entries(20)),
+            State(halted=True),
+        ):
             new, effects = update(CFG, state, QueueChanged(STOPPED, NOW))
             self.assertEqual(of_type(effects, StartRefill), [])
+            self.assertEqual(of_type(effects, Enqueue), [])
             self.assertEqual(new.filling, state.filling)
 
     def test_album_mode_uses_album_sizes(self):
@@ -181,7 +199,7 @@ class RefillTestCase(unittest.TestCase):
         self.assertEqual(state.jukebox_queue, entries(102)[2:])
         self.assertEqual(
             effects,
-            (Enqueue(Mode.SONG, entries(2)), Persist(entries(102)[2:])),
+            (Enqueue(Mode.SONG, entries(2), 2), Persist(entries(102)[2:])),
         )
 
     def test_done_without_add_persists(self):
@@ -228,26 +246,75 @@ class RefillTestCase(unittest.TestCase):
         self.assertEqual(effects, (Persist(()),))
 
 
+def enqueued(attempted, added, wanted, status):
+    return Enqueued(attempted, added, wanted, status, NOW)
+
+
 class EnqueuedTestCase(unittest.TestCase):
     def test_starts_playback(self):
-        state = State(jukebox_queue=entries(50))
-        _, effects = update(CFG, state, Enqueued(2, STOPPED, NOW))
+        state = State(jukebox_queue=entries(50), enqueuing=True)
+        state, effects = update(CFG, state, enqueued(2, 2, 2, STOPPED))
         self.assertIn(Play(), effects)
+        self.assertFalse(state.enqueuing)
 
     def test_already_playing(self):
         state = State(jukebox_queue=entries(50))
-        _, effects = update(CFG, state, Enqueued(1, PLAYING, NOW))
+        _, effects = update(CFG, state, enqueued(1, 1, 1, PLAYING))
         self.assertNotIn(Play(), effects)
 
-    def test_nothing_added_is_an_error(self):
-        state, effects = update(CFG, State(), Enqueued(0, STOPPED, NOW))
-        self.assertEqual(state.last_error, core.ADD_FAILED)
+    def test_failed_entries_are_replaced_by_the_next(self):
+        state = State(jukebox_queue=entries(5), enqueuing=True)
+        state, effects = update(CFG, state, enqueued(2, 1, 2, STOPPED))
+        self.assertIn(Play(), effects)
+        self.assertEqual(
+            of_type(effects, Enqueue), [Enqueue(Mode.SONG, entries(1), 1)]
+        )
+        self.assertIn(Persist(entries(5)[1:]), effects)
+        self.assertTrue(state.enqueuing)
+        self.assertEqual(state.add_failures, 0)
+
+    def test_all_failed_keeps_going_without_playing(self):
+        state = State(jukebox_queue=entries(5))
+        state, effects = update(CFG, state, enqueued(2, 0, 2, STOPPED))
         self.assertNotIn(Play(), effects)
-        self.assertEqual(of_type(effects, Log)[0].message, core.ADD_FAILED)
+        self.assertEqual(of_type(effects, Enqueue)[0].entries, entries(2))
+        self.assertEqual(state.add_failures, 2)
+
+    def test_empty_jukebox_queue_refills_the_rest(self):
+        state = State()
+        state, effects = update(CFG, state, enqueued(2, 1, 2, PLAYING))
+        self.assertEqual(
+            of_type(effects, StartRefill), [StartRefill(Mode.SONG, (), 101, 1)]
+        )
+        self.assertTrue(state.filling)
+        self.assertFalse(state.enqueuing)
+
+    def test_no_retry_while_filling(self):
+        state = State(jukebox_queue=entries(5), filling=True)
+        _, effects = update(CFG, state, enqueued(1, 0, 1, PLAYING))
+        self.assertEqual(of_type(effects, Enqueue), [])
+        self.assertEqual(of_type(effects, StartRefill), [])
+
+    def test_endless_failures_halt(self):
+        cfg = replace(CFG, queue_length_song=10)
+        state = State(jukebox_queue=entries(50), add_failures=8)
+        state, effects = update(cfg, state, enqueued(2, 0, 2, STOPPED))
+        self.assertTrue(state.halted)
+        self.assertIn('10 times in a row', state.last_error)
+        self.assertEqual(of_type(effects, Enqueue), [])
+        self.assertIn(CancelTimer(core.JUKEBOX_TIMER), effects)
+        # A restart starts counting again.
+        state, _ = update(cfg, state, Restart(NOW))
+        self.assertEqual(state.add_failures, 0)
+
+    def test_success_resets_failures(self):
+        state = State(jukebox_queue=entries(50), add_failures=5)
+        state, _ = update(CFG, state, enqueued(1, 1, 1, PLAYING))
+        self.assertEqual(state.add_failures, 0)
 
     def test_topup_when_short(self):
         state = State(jukebox_queue=entries(9))
-        state, effects = update(CFG, state, Enqueued(1, PLAYING, NOW))
+        state, effects = update(CFG, state, enqueued(1, 1, 1, PLAYING))
         self.assertTrue(state.filling)
         self.assertEqual(
             of_type(effects, StartRefill),
@@ -256,8 +323,69 @@ class EnqueuedTestCase(unittest.TestCase):
 
     def test_no_topup_while_filling(self):
         state = State(jukebox_queue=entries(1), filling=True)
-        _, effects = update(CFG, state, Enqueued(1, PLAYING, NOW))
+        _, effects = update(CFG, state, enqueued(1, 1, 1, PLAYING))
         self.assertEqual(of_type(effects, StartRefill), [])
+
+
+class ValidationTestCase(unittest.TestCase):
+    def test_database_change_checks_the_queue(self):
+        state = State(jukebox_queue=entries(20))
+        state, effects = update(CFG, state, DatabaseChanged(NOW))
+        self.assertEqual(effects, (Validate(Mode.SONG, entries(20)),))
+        self.assertTrue(state.validating)
+
+    def test_nothing_to_check(self):
+        state, effects = update(CFG, State(), DatabaseChanged(NOW))
+        self.assertEqual(effects, ())
+        self.assertFalse(state.validating)
+
+    def test_missing_entries_are_dropped(self):
+        state = State(jukebox_queue=entries(20), validating=True)
+        missing = frozenset({'s3', 's5', 'gone'})
+        state, effects = update(CFG, state, Validated(missing, NOW))
+        kept = tuple(e for e in entries(20) if e.key not in missing)
+        self.assertEqual(state.jukebox_queue, kept)
+        self.assertFalse(state.validating)
+        self.assertIn(Persist(kept), effects)
+        self.assertIn(
+            'Dropped 2 picked entries', of_type(effects, Log)[0].message
+        )
+
+    def test_nothing_missing(self):
+        state = State(jukebox_queue=entries(20), validating=True)
+        state, effects = update(CFG, state, Validated(frozenset(), NOW))
+        self.assertEqual(effects, ())
+
+    def test_dropping_below_minimum_tops_up(self):
+        state = State(jukebox_queue=entries(11), validating=True)
+        state, effects = update(
+            CFG, state, Validated(frozenset({'s0', 's1'}), NOW)
+        )
+        self.assertTrue(state.filling)
+        self.assertEqual(len(of_type(effects, StartRefill)), 1)
+
+    def test_change_during_a_check_checks_again(self):
+        state = State(jukebox_queue=entries(20), validating=True)
+        state, effects = update(CFG, state, DatabaseChanged(NOW))
+        self.assertEqual(effects, ())
+        self.assertTrue(state.revalidate)
+        state, effects = update(CFG, state, Validated(frozenset({'s0'}), NOW))
+        self.assertEqual(
+            of_type(effects, Validate), [Validate(Mode.SONG, entries(20)[1:])]
+        )
+        self.assertTrue(state.validating)
+        self.assertFalse(state.revalidate)
+
+    def test_change_during_a_refill_checks_its_picks(self):
+        state = State(filling=True)
+        state, effects = update(CFG, state, DatabaseChanged(NOW))
+        self.assertEqual(effects, ())
+        self.assertTrue(state.revalidate)
+        state, effects = update(CFG, state, RefillDone(entries(102), 2, NOW))
+        self.assertEqual(
+            of_type(effects, Validate),
+            [Validate(Mode.SONG, entries(102)[2:])],
+        )
 
 
 class ScrobbleTestCase(unittest.TestCase):

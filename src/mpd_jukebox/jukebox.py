@@ -16,8 +16,6 @@ SCROBBLE_TIMER = 'scrobble'
 SCROBBLE_TIME_MAX = 240
 SCROBBLE_TIME_TOTAL = 480
 
-ADD_FAILED = 'Adding songs from jukebox to queue failed'
-
 
 # --------------------------------------------------------------------------
 # State
@@ -27,6 +25,14 @@ ADD_FAILED = 'Adding songs from jukebox to queue failed'
 class State:
     jukebox_queue: tuple[Entry, ...] = ()
     filling: bool = False
+    # An Enqueue is being carried out; no other run may take entries.
+    enqueuing: bool = False
+    # Failed adds since the last successful one.
+    add_failures: int = 0
+    # A check of the jukebox queue against MPD's database is running, or
+    # another one is due once it (or a refill) finishes.
+    validating: bool = False
+    revalidate: bool = False
     halted: bool = False
     last_error: str = ''
     status: Status | None = None
@@ -76,8 +82,28 @@ class RefillFailed:
 
 @dataclass(frozen=True, slots=True)
 class Enqueued:
+    """Result of an Enqueue: `added` of the `attempted` entries made it
+    into MPD's queue; `wanted` is the Enqueue's."""
+
+    attempted: int
     added: int
+    wanted: int
     status: Status
+    now: int
+
+
+@dataclass(frozen=True, slots=True)
+class DatabaseChanged:
+    """MPD's database changed: picked entries may no longer exist."""
+
+    now: int
+
+
+@dataclass(frozen=True, slots=True)
+class Validated:
+    """Result of a Validate: the keys that are not in MPD's database."""
+
+    missing: frozenset[str]
     now: int
 
 
@@ -94,6 +120,8 @@ Event = (
     | RefillDone
     | RefillFailed
     | Enqueued
+    | DatabaseChanged
+    | Validated
     | Restart
 )
 
@@ -115,6 +143,18 @@ class StartRefill:
 
 @dataclass(frozen=True, slots=True)
 class Enqueue:
+    """Add the entries to MPD's queue; `wanted` of them are needed (more
+    entries follow if some fail, as in myMPD's jukebox_add_to_queue)."""
+
+    mode: Mode
+    entries: tuple[Entry, ...]
+    wanted: int
+
+
+@dataclass(frozen=True, slots=True)
+class Validate:
+    """Check which entries no longer exist in MPD's database."""
+
     mode: Mode
     entries: tuple[Entry, ...]
 
@@ -156,6 +196,7 @@ class Log:
 Effect = (
     StartRefill
     | Enqueue
+    | Validate
     | Play
     | SetTimer
     | CancelTimer
@@ -241,9 +282,21 @@ def _refill(
     )
 
 
+def _enqueue(cfg: Config, state: State, wanted: int) -> Step:
+    """Move up to `wanted` entries from the jukebox queue to MPD."""
+    taken, rest = take(state.jukebox_queue, wanted)
+    state = replace(state, jukebox_queue=rest, enqueuing=True)
+    return state, (Enqueue(cfg.mode, taken, wanted), Persist(rest))
+
+
 def run(cfg: Config, state: State) -> Step:
     """myMPD's jukebox_run (§1.4)."""
-    if state.filling or state.halted or state.status is None:
+    if (
+        state.filling
+        or state.enqueuing
+        or state.halted
+        or state.status is None
+    ):
         return state, ()
     add = add_count(cfg, state.status.queue_length)
     if add is None:
@@ -251,9 +304,32 @@ def run(cfg: Config, state: State) -> Step:
     if add > len(state.jukebox_queue):
         state, effect = _refill(cfg, state, state.jukebox_queue, add)
         return state, (effect,)
-    taken, rest = take(state.jukebox_queue, add)
-    state = replace(state, jukebox_queue=rest)
-    return state, (Enqueue(cfg.mode, taken), Persist(rest))
+    return _enqueue(cfg, state, add)
+
+
+def _validate(cfg: Config, state: State) -> Step:
+    """Check the jukebox queue against MPD's database, or note that a check
+    is due once the running check or refill is done."""
+    if state.filling or state.validating:
+        return replace(state, revalidate=True), ()
+    state = replace(state, revalidate=False)
+    if not state.jukebox_queue:
+        return state, ()
+    state = replace(state, validating=True)
+    return state, (Validate(cfg.mode, state.jukebox_queue),)
+
+
+def _topup(cfg: Config, state: State) -> Step:
+    """Refill in the background when the jukebox queue runs low."""
+    if (
+        state.filling
+        or state.enqueuing
+        or state.halted
+        or not needs_topup(cfg, len(state.jukebox_queue))
+    ):
+        return state, ()
+    state, refill = _refill(cfg, state, state.jukebox_queue, 0)
+    return state, (refill,)
 
 
 # --------------------------------------------------------------------------
@@ -288,42 +364,84 @@ def _on_refill_done(cfg: Config, state: State, event: RefillDone) -> Step:
         state, filling=False, last_error='', jukebox_queue=event.entries
     )
     if event.add == 0:
-        return state, (Persist(event.entries),)
-    taken, rest = take(event.entries, event.add)
-    state = replace(state, jukebox_queue=rest)
-    return state, (Enqueue(cfg.mode, taken), Persist(rest))
+        effects: tuple[Effect, ...] = (Persist(event.entries),)
+    else:
+        state, effects = _enqueue(cfg, state, event.add)
+    if state.revalidate:
+        # The database changed while the refill was picking.
+        state, more = _validate(cfg, state)
+        effects += more
+    return state, effects
 
 
-def _on_refill_failed(state: State, event: RefillFailed) -> Step:
-    state = replace(state, filling=False, halted=True, last_error=event.error)
+def _halt(state: State, error: str) -> Step:
+    state = replace(
+        state, filling=False, enqueuing=False, halted=True, last_error=error
+    )
     return state, (
         Log(
             logging.ERROR,
-            f'Jukebox halted: {event.error}. Send SIGHUP to restart it.',
+            f'Jukebox halted: {error}. Send SIGHUP to restart it.',
         ),
         CancelTimer(JUKEBOX_TIMER),
     )
 
 
+def _on_refill_failed(state: State, event: RefillFailed) -> Step:
+    return _halt(state, event.error)
+
+
 def _on_enqueued(cfg: Config, state: State, event: Enqueued) -> Step:
     state, effects = _observe(cfg, state, event.status)
-    if event.added == 0:
-        state = replace(state, last_error=ADD_FAILED)
-        return state, effects + (Log(logging.ERROR, ADD_FAILED),)
-    if event.status.state is not PlayState.PLAY:
+    failures = 0 if event.added else state.add_failures + event.attempted
+    state = replace(state, enqueuing=False, add_failures=failures)
+    if failures >= queue_size(cfg, cfg.mode):
+        state, more = _halt(
+            state, f"adding to MPD's queue failed {failures} times in a row"
+        )
+        return state, effects + more
+    if event.added and event.status.state is not PlayState.PLAY:
         effects += (Play(),)
-    if (
-        not state.filling
-        and not state.halted
-        and needs_topup(cfg, len(state.jukebox_queue))
-    ):
-        state, refill = _refill(cfg, state, state.jukebox_queue, 0)
-        effects += (refill,)
-    return state, effects
+
+    # Entries that failed are replaced by the next ones, as in myMPD.
+    missing = event.wanted - event.added
+    if missing > 0 and not state.halted and not state.filling:
+        if state.jukebox_queue:
+            state, more = _enqueue(cfg, state, missing)
+        else:
+            state, refill = _refill(cfg, state, (), missing)
+            more = (refill,)
+        return state, effects + more
+
+    state, more = _topup(cfg, state)
+    return state, effects + more
+
+
+def _on_validated(cfg: Config, state: State, event: Validated) -> Step:
+    kept = tuple(e for e in state.jukebox_queue if e.key not in event.missing)
+    effects: tuple[Effect, ...] = ()
+    dropped = len(state.jukebox_queue) - len(kept)
+    state = replace(state, validating=False, jukebox_queue=kept)
+    if dropped:
+        effects += (
+            Log(
+                logging.INFO,
+                f'Dropped {dropped} picked entries that are no longer in '
+                "MPD's database",
+            ),
+            Persist(kept),
+        )
+    if state.revalidate:
+        state, more = _validate(cfg, state)
+        effects += more
+    state, more = _topup(cfg, state)
+    return state, effects + more
 
 
 def _on_restart(cfg: Config, state: State) -> Step:
-    state = replace(state, halted=False, last_error='', jukebox_queue=())
+    state = replace(
+        state, halted=False, last_error='', add_failures=0, jukebox_queue=()
+    )
     state, effects = run(cfg, state)
     return state, (Persist(()),) + effects
 
@@ -331,8 +449,14 @@ def _on_restart(cfg: Config, state: State) -> Step:
 def update(cfg: Config, state: State, event: Event) -> Step:
     match event:
         case Connected():
-            state = replace(state, filling=False)
-            return _on_status(cfg, state, event.status, trigger=True)
+            # Work from an earlier connection was abandoned.
+            state = replace(
+                state, filling=False, enqueuing=False, validating=False
+            )
+            state, effects = _on_status(cfg, state, event.status, trigger=True)
+            # The database may have changed while we were away.
+            state, more = _validate(cfg, state)
+            return state, effects + more
         case QueueChanged():
             return _on_status(cfg, state, event.status, trigger=True)
         case PlayerChanged():
@@ -345,6 +469,10 @@ def update(cfg: Config, state: State, event: Event) -> Step:
             return _on_refill_failed(state, event)
         case Enqueued():
             return _on_enqueued(cfg, state, event)
+        case DatabaseChanged():
+            return _validate(cfg, state)
+        case Validated():
+            return _on_validated(cfg, state, event)
         case Restart():
             return _on_restart(cfg, state)
     raise AssertionError(event)  # pragma: no cover

@@ -5,7 +5,7 @@ import unittest
 from dataclasses import replace
 
 from mpd_jukebox import jukebox as core
-from mpd_jukebox.config import Settings, parse_config
+from mpd_jukebox.config import Settings, fingerprint, parse_config
 from mpd_jukebox.connection import Connection
 from mpd_jukebox.model import Entry, Mode
 from mpd_jukebox.mpd_io import FatalMpdError, MpdIO
@@ -225,12 +225,74 @@ class RuntimeTestCase(unittest.IsolatedAsyncioTestCase):
         await self.start(fake2, raw, store=store)
         await wait_for(lambda: len(fake2.queue) == 3)
 
-    async def test_failed_adds(self):
+    async def test_adds_that_keep_failing_halt(self):
         fake = FakeMPD(library(150))
         fake.fail_add = {s['file'] for s in fake.library}
         runtime, _ = await self.start(fake)
-        await wait_for(lambda: runtime.state.last_error == core.ADD_FAILED)
+        await wait_for(lambda: runtime.state.halted)
+        self.assertIn('100 times in a row', runtime.state.last_error)
         self.assertEqual(fake.queue, [])
+        self.assertEqual(fake.commands.count('add'), 100)
+
+    async def test_stale_saved_entries_are_skipped_and_dropped(self):
+        store = await self.store()
+        await store.load_queue(fingerprint(parse_config({}).config))
+        saved = (
+            Entry('gone0.mp3', 1, 'G0'),
+            Entry('s1.mp3', 2, 'Artist s1'),
+            Entry('gone1.mp3', 3, 'G1'),
+        ) + tuple(Entry(f's{i}.mp3', i, f'Artist s{i}') for i in range(2, 30))
+        await store.save_queue(saved)
+
+        fake = FakeMPD(library(150))
+        runtime, _ = await self.start(fake, store=store)
+        # gone0 fails and is replaced by s1, as in myMPD.
+        await wait_for(lambda: fake.uris() == ['s1.mp3'])
+        await wait_for(lambda: fake.state == 'play')
+        # The check on connect drops gone1 before it is reached.
+        await wait_for(
+            lambda: all(
+                not e.key.startswith('gone')
+                for e in runtime.state.jukebox_queue
+            )
+        )
+        self.assertEqual(len(runtime.state.jukebox_queue), 28)
+        self.assertEqual(fake.commands.count('add'), 2)
+
+    async def test_database_change_drops_removed_songs(self):
+        fake = FakeMPD(library(150))
+        runtime, _ = await self.start(fake)
+        await wait_for(lambda: len(runtime.state.jukebox_queue) == 100)
+        await wait_for(lambda: not runtime.state.validating)
+        removed = {e.key for e in runtime.state.jukebox_queue[:5]}
+        fake.library = [s for s in fake.library if s['file'] not in removed]
+        fake.notify('database')
+        await wait_for(lambda: len(runtime.state.jukebox_queue) == 95)
+        self.assertFalse(
+            removed & {e.key for e in runtime.state.jukebox_queue}
+        )
+        self.assertEqual(
+            {e.key for e in await runtime.store.queue()},
+            {e.key for e in runtime.state.jukebox_queue},
+        )
+
+    async def test_database_change_in_album_mode(self):
+        fake = FakeMPD(albums(30))
+        raw = {'jukebox': {'mode': 'album'}}
+        runtime, _ = await self.start(fake, raw)
+        await wait_for(lambda: len(runtime.state.jukebox_queue) == 25)
+        await wait_for(lambda: not runtime.state.validating)
+        first = runtime.state.jukebox_queue[0]
+        index = runtime.refiller.albums
+        assert index is not None
+        album = index[first.key]
+        fake.library = [s for s in fake.library if s['file'] not in album.uris]
+        fake.notify('database')
+        await wait_for(
+            lambda: (
+                first.key not in {e.key for e in runtime.state.jukebox_queue}
+            )
+        )
 
     async def test_include_filter_and_playlist_sources(self):
         lib = library(150) + [
@@ -360,8 +422,9 @@ class HandleTestCase(unittest.IsolatedAsyncioTestCase):
         effect = core.Enqueue(
             Mode.ALBUM,
             (Entry('missing', 1, 'x'), Entry(good, 2, 'Artist')),
+            2,
         )
-        with self.assertLogs('mpd_jukebox.runtime', 'ERROR'):
+        with self.assertLogs('mpd_jukebox.runtime', 'WARNING'):
             self.assertEqual(await runtime._enqueue(io, effect), 1)
 
     async def test_log_effect(self):

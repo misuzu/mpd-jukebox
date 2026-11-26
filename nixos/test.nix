@@ -42,15 +42,18 @@ pkgs.testers.runNixOSTest {
 
   nodes = {
     # Song mode over TCP, against an MPD that refuses everything without
-    # the password.
+    # the password. Its music is a writable copy, so songs can be removed
+    # under the running jukebox.
     tcp = {
       imports = [
         module
         tools
       ];
+      systemd.tmpfiles.rules = [ "C /srv/music - - - - ${music}" ];
       services.mpd = {
         enable = true;
         settings = mpdSettings // {
+          music_directory = "/srv/music";
           default_permissions = "";
         };
         credentials = [
@@ -187,6 +190,45 @@ pkgs.testers.runNixOSTest {
             "mpd-jukebox --config /etc/mpd-jukebox/config.toml list"
         )
         assert 10 <= len(output.splitlines()) <= 20, output
+
+    def pick(which):
+        # `list` needs no password file, even while the service is stopped.
+        return tcp.succeed(
+            "mpd-jukebox --config /etc/mpd-jukebox/config.toml list "
+            f"| {which} -n 1 | cut -f2"
+        ).strip()
+
+    with subtest("a song removed from the library is dropped from the picks"):
+        # The last pick: the next ones may be added while MPD updates.
+        gone = pick("tail")
+        tcp.succeed(f"rm '/srv/music/{gone}'")
+        mpc(tcp, tcp_host, "update --wait")
+        tcp.wait_until_succeeds(
+            "! mpd-jukebox --config /etc/mpd-jukebox/config.toml list "
+            f"| cut -f2 | grep -qxF '{gone}'",
+            timeout=30,
+        )
+        tcp.succeed(
+            "journalctl -u mpd-jukebox.service "
+            "| grep -q 'Dropped 1 picked entries'"
+        )
+
+    with subtest("a pick that vanished while stopped is skipped, as in myMPD"):
+        tcp.succeed("systemctl stop mpd-jukebox.service")
+        gone = pick("head")
+        tcp.succeed(f"rm '/srv/music/{gone}'")
+        mpc(tcp, tcp_host, "update --wait")
+        mpc(tcp, tcp_host, "clear")
+        tcp.succeed("systemctl start mpd-jukebox.service")
+        tcp.wait_until_succeeds(
+            f"test $(mpc -h {tcp_host} playlist | wc -l) -eq 2", timeout=30
+        )
+        tcp.wait_until_succeeds(
+            f"mpc -h {tcp_host} status | grep -q '\\[playing\\]'", timeout=30
+        )
+        journal = tcp.succeed("journalctl -u mpd-jukebox.service")
+        assert f"Adding {gone} failed, skipping it" in journal, journal
+        assert gone not in playlist(tcp, tcp_host)
 
     with subtest("album mode adds whole albums in track order"):
         socket_host = "/run/mpd/socket"

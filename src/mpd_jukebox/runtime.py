@@ -39,7 +39,7 @@ from .store import Store
 
 log = logging.getLogger(__name__)
 
-IDLE_SUBSYSTEMS = ['playlist', 'player']
+IDLE_SUBSYSTEMS = ['playlist', 'player', 'database']
 BACKOFF_INITIAL = 1.0
 BACKOFF_MAX = 60.0
 
@@ -350,6 +350,8 @@ class Runtime:
                 self._events.put_nowait(core.QueueChanged(status, now))
             if 'player' in changed:
                 self._events.put_nowait(core.PlayerChanged(status, now))
+            if 'database' in changed:
+                self._events.put_nowait(core.DatabaseChanged(now))
 
     def _fire(self, name: str, io: MpdIO) -> None:
         self._timers.pop(name, None)
@@ -358,6 +360,17 @@ class Runtime:
     async def _timer_event(self, name: str, io: MpdIO) -> None:
         status = await io.status()
         self._events.put_nowait(core.TimerFired(name, status, self.now()))
+
+    async def _validate(self, io: MpdIO, effect: core.Validate) -> None:
+        """Find picked entries that left MPD's database."""
+        if effect.mode is Mode.SONG:
+            missing = [
+                e.key for e in effect.entries if not await io.exists(e.key)
+            ]
+        else:
+            albums = await self.refiller.album_index(io)
+            missing = [e.key for e in effect.entries if e.key not in albums]
+        self._events.put_nowait(core.Validated(frozenset(missing), self.now()))
 
     async def _refill(self, io: MpdIO, effect: core.StartRefill) -> None:
         try:
@@ -377,12 +390,16 @@ class Runtime:
                 assert self._refill_task is None or self._refill_task.done()
                 log.info('Filling jukebox queue')
                 self._refill_task = self._spawn(self._refill(io, effect))
-            case core.Enqueue():
+            case core.Enqueue(_, entries, wanted):
                 added = await self._enqueue(io, effect)
                 status = await io.status()
                 self._events.put_nowait(
-                    core.Enqueued(added, status, self.now())
+                    core.Enqueued(
+                        len(entries), added, wanted, status, self.now()
+                    )
                 )
+            case core.Validate():
+                self._spawn(self._validate(io, effect))
             case core.Play():
                 log.debug('Jukebox: start playback')
                 await io.play()
@@ -424,7 +441,10 @@ class Runtime:
         for entry in effect.entries:
             album = albums.get(entry.key)
             if album is None:
-                log.error('Jukebox album %s not found', entry.key)
+                log.warning(
+                    'Album %s is no longer in the database, skipping it',
+                    entry.tag_value or entry.key,
+                )
                 continue
             results = [await io.add(uri) for uri in album.uris]
             if any(results):

@@ -305,9 +305,12 @@ Config(mode, playlist, queue_length, last_played_hours, uniq_tag, ignore_hated,
 Status(state: 'play'|'pause'|'stop', queue_length: int, song_id: int|None,
        song_uri: str|None, elapsed: float, duration: float, crossfade: int)
 
-State(halted: bool,                     # set by a failed refill (§1.7); cleared only by Restart
+State(halted: bool,                     # set by a failed refill (§1.7) or endless failed adds; cleared only by Restart
       jukebox_queue: tuple[Entry, ...],
-      filling: bool,
+      filling: bool,                    # a refill is running
+      enqueuing: bool,                  # an Enqueue is being carried out; no other run takes entries
+      add_failures: int,                # failed adds since the last successful one
+      validating: bool, revalidate: bool,   # a database check is running / is due afterwards
       last_error: str,
       status: Status | None)                  # last status seen; scrobble data comes from it
 ```
@@ -325,12 +328,15 @@ PlayerChanged(status, now)           # idle "player"
 TimerFired(name: 'jukebox'|'scrobble', status, now)   # the shell fetches a fresh status
 RefillDone(entries: tuple[Entry, ...], add: int, now)
 RefillFailed(error: str, now)
-Enqueued(added: int, status, now)    # result of an Enqueue effect
+Enqueued(attempted, added, wanted, status, now)   # result of an Enqueue effect
+DatabaseChanged(now)                 # idle "database"
+Validated(missing: frozenset[str], now)   # result of a Validate effect
 Restart(now)                         # SIGHUP: clear `halted`, `last_error` and the jukebox queue, then run
 
 # Effects: plain data that the shell interprets
 StartRefill(mode: Mode, existing: tuple[Entry, ...], expected: int, add: int)
-Enqueue(mode: Mode, entries: tuple[Entry, ...])   # song: add URI; album: add album URIs
+Enqueue(mode: Mode, entries: tuple[Entry, ...], wanted: int)   # song: add URI; album: add album URIs
+Validate(mode: Mode, entries: tuple[Entry, ...])  # which entries left MPD's database?
 Play()
 SetTimer(name, seconds) / CancelTimer(name)
 RecordPlay(uri, played_at, started_at)  # history row, plus stickers if write_stickers
@@ -401,7 +407,7 @@ instead: `randrange(state, n) -> (k, state')`. The PRNG state is stored in
 ### 5.1 Runtime (`runtime.py`)
 
 - One python-mpd2 `mpd.asyncio.MPDClient` connection. A background task
-  iterates `idle(['playlist', 'player'])`. python-mpd2's asyncio client sends
+  iterates `idle(['playlist', 'player', 'database'])`. python-mpd2's asyncio client sends
   `noidle` by itself whenever another command is issued, and resumes idling
   afterwards, so a second connection is not needed.
 - An `asyncio.Queue[Event]` collects events from the idle listener, the timers
@@ -411,7 +417,20 @@ instead: `randrange(state, n) -> (k, state')`. The PRNG state is stored in
   `filling`, and the shell asserts it as well.
 - The main loop is `state, effs = update(cfg, state, ev)`, then each effect is
   interpreted in order. `Enqueue` produces `Enqueued`. Failures of individual
-  `add` commands are logged, and only the successful count is reported.
+  `add` commands are logged as warnings, and the counts are reported.
+- **Failed adds** (§1.5). As in myMPD, entries that cannot be added are
+  replaced by the next ones until `wanted` entries are in MPD's queue. The
+  core takes the replacements from the jukebox queue in further `Enqueue`
+  rounds; if the jukebox queue runs out, it refills with the number still
+  missing. If adds fail `queue_length_song` (or `queue_length_album`) times
+  in a row, the jukebox halts instead of churning through picks forever.
+- **Database changes** (§7). On idle `database`, and on every connect, the
+  core asks the shell to `Validate` the jukebox queue. A background task
+  checks each entry: `find file <uri>` in song mode, or membership in a
+  rebuilt album index in album mode. The core then drops the missing
+  entries, persists the rest and tops up if needed. A change during a check
+  or a refill leads to another check once it finishes, so picks made from a
+  database that was being updated are checked too.
 - The connection authenticates with `password` first if one is configured
   (§5.5).
 - A failure in a background task (idle listener, timer, refill) is forwarded
@@ -844,3 +863,9 @@ runs two machines with a real MPD, a null audio output and 90 generated
 9. **Album tags** are merged across the album's songs: each tag keeps its
    distinct values in order of first appearance. `last_modified` is the
    newest and `added` the oldest of its songs, as in myMPD.
+10. **Picks are checked against database changes.** myMPD keeps its jukebox
+    queue until it is used up, so songs removed or renamed in the library
+    (for example a CUE image split into tracks) fail when their turn comes
+    and are skipped then. We also skip them, as myMPD does, but in addition
+    drop them as soon as MPD reports a database change, or on connect, when
+    the database may have changed while we were away (§5.1).
