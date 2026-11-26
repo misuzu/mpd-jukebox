@@ -79,6 +79,9 @@ The host, port and password come from, highest priority first:
 and `password@@abstract`. A password embedded in one source is never sent
 to a host from another source.
 
+The exact rules, and why they are what they are, are in
+[DESIGN.md](./DESIGN.md) (§5.5).
+
 `--password` is visible in the process list. Use `MPD_HOST`, or
 `password_file` in the configuration file, instead. A wrong password, or a
 missing one when MPD requires it, stops the daemon with an error; it does

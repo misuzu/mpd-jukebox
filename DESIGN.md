@@ -12,8 +12,8 @@ talks to MPD and SQLite, turns what it sees into events for the core, and
 carries out the effects the core returns.
 
 This document has three parts: §1 describes myMPD's behaviour (what we
-port), §2–§6 describe the Python design, and §7 lists deviations from myMPD
-and the decisions behind them.
+port), §2–§6 describe the Python design, and §7 lists where we deviate from
+myMPD and what we keep on purpose.
 
 ---
 
@@ -207,29 +207,29 @@ myMPD evaluates filters locally with a small subset of MPD's filter syntax:
 
 **In scope:** modes `song` and `album`; every constraint in §1.1 except
 `autostart`; the trigger rules in §1.3–§1.5 (with the connect rule changed,
-see §7); reservoir selection (§1.7); album keys (§1.8); a
+see §7.1); reservoir selection (§1.7); album keys (§1.8); a
 local filter evaluator (§1.9); scrobble tracking and last-played history
 (§1.10); persistence. The daemon always uses MPD's default partition and
 never sends the `partition` command.
 
 **Out of scope:** the `off` mode and the `autostart` setting (running the
 daemon means the jukebox is on), Lua scripting (the `script` mode and
-triggers), MPD partitions, presets, the web UI and JSON-RPC API, myMPD's "simple" album
-mode, and fuzzy `~~` matching
-(a filter that uses it is a config error; see §7).
+triggers), MPD partitions, presets, the web UI and JSON-RPC API, myMPD's
+"simple" album mode, and fuzzy `~~` matching (a filter that uses it is a
+config error; see §7.1).
 
 ---
 
 ## 3. Architecture
 
 ```
-            ┌──────────────────── imperative shell (asyncio) ───────────────────┐
- MPD idle ─►│ events.py: MPD/timer/worker  ──Event──►  core.update(state, ev)   │
- timers  ─►│                                          │                        │
- refill  ─►│                         (state', [Effect])◄                        │
-            │ effects.py: interpret Effect → MPD cmds / SQLite / timers / tasks │
-            └───────────────────────────────────────────────────────────────────┘
-                     functional core: pure, no I/O, no clock, no global RNG
+          runtime.py (imperative shell, asyncio)
+  MPD idle ──┐
+  timers   ──┼──► Event ──► jukebox.update(cfg, state, event) ──► (state', effects)
+  tasks    ──┘                     functional core:                       │
+     ▲                     pure, no I/O, no clock, no global RNG          │
+     └──── results as new Events ◄── interpret effects: MPD commands, ◄───┘
+                                     SQLite, timers, background tasks
 ```
 
 The core follows the Elm/TEA pattern:
@@ -244,75 +244,73 @@ the results back as new events. The current time and random seeds always come
 MPD.
 
 Random selection (§1.7) has to stream thousands of songs from MPD, so it
-cannot be one pure call over a list. It is a **pure fold**:
-
-```python
-select_step(ctx: SelectContext, acc: Reservoir, candidate: Candidate) -> Reservoir
-```
-
-The shell drives that fold over an async stream of MPD result windows. The
-fold carries its own PRNG state (§4.4), so given the same seed and inputs it
-always produces the same result.
+cannot be one pure call over a list. It is a **pure fold**: the pure
+`song_candidate` / `album_candidate` apply the constraints to one song or
+album, and `select_step(acc, candidate)` performs one step of reservoir
+sampling. The shell drives that fold over MPD's result windows. The
+accumulator carries its own PRNG state (§4.4), so given the same seed and
+inputs the fold always produces the same result.
 
 ### 3.1 Package layout (`src/mpd_jukebox/`)
 
 | Module | Kind | Contents |
 |---|---|---|
-| `model.py` | core | Frozen dataclasses and enums: `Song`, `Album`, `Entry`, `Config`, `Status`, `ConfigError` |
-| `rng.py` | core | Pure SplitMix64: `next(state) -> (value, state)`, `randrange` |
-| `filters.py` | core | Parser and evaluator for filter expressions (§1.9) → `Predicate` |
-| `tags.py` | core | Tag value extraction, joining, normalisation, `album_key(song, cfg)` |
-| `albums.py` | core | `build_albums(songs) -> Mapping[key, Album]`, as a fold over a stream |
-| `constraints.py` | core | Small composable predicates: duration, last played, hated, expression, uniqueness |
-| `select.py` | core | `Reservoir`, `select_step`, `select_init`, `select_result` (§1.7) |
-| `jukebox.py` | core | `State`, events, effects and `update()`: trigger rules, `jukebox_run`, moving entries, refill bookkeeping, timer and scrobble scheduling |
-| `connection.py` | core | `parse_mpd_host`, `resolve_connection`: MPD address and password from CLI, config and environment (§5.5) |
-| `config.py` | shell-edge | TOML → `Config` (pure `parse_config(dict)`; reading the file stays in the shell) |
-| `mpd_io.py` | shell | python-mpd2 asyncio wrapper: status, queue, windowed search and listplaylist, stickers, add, searchadd, play |
-| `migrate.py` | core | Pure migration planning: `parse_name`, `split_statements`, `plan`, `pending` (§5.3.1) |
-| `migrations/` | data | Schema migrations as `NNNN_description.sql` files, shipped as package data |
-| `store.py` | shell | aiosqlite: applies migrations; reads and writes the jukebox queue, last-played history and meta (constraint fingerprint) |
-| `runtime.py` | shell | The event loop: idle listener, timers, refill task, effect interpreter |
-| `cli.py` | shell | click entry points |
-
-`jukebox.py` currently holds a from-documentation sketch. It will be replaced
-by the modules above. Any ideas worth keeping from it (predicate combinators,
-frozen data) carry over.
+| `model.py` | core | Frozen dataclasses and enums: `Song`, `Album`, `Entry`, `Mode`, `PlayState`, `Status`, `AlbumSettings`, `Config`; `ConfigError` |
+| `rng.py` | core | Pure SplitMix64: `next_u64`, `randrange` (§4.4) |
+| `tags.py` | core | Tag names, values and normalisation; `album_key(tags, settings)` (§1.8) |
+| `filters.py` | core | Parser and evaluator for filter expressions (§1.9) |
+| `albums.py` | core | `build_albums`: songs grouped into an album index |
+| `constraints.py` | core | Selection inputs and constraints: `make_context`, `song_candidate`, `album_candidate`, `uniq_context`, last-played and hated maps (§1.6, §1.7) |
+| `select.py` | core | The selection fold: `select_init`, `select_step`, `more_windows`, `select_result` (§1.7) |
+| `jukebox.py` | core | `State`, events, effects and `update()`: trigger rules, moving entries to MPD, refills, validation, timers, scrobbles (§4.2) |
+| `connection.py` | core | MPD address and password from CLI, config and environment (§5.5) |
+| `migrate.py` | core | Migration planning: `parse_name`, `split_statements`, `plan`, `pending` (§5.3.1) |
+| `config.py` | core, plus file reading | `parse_config` (pure) and `fingerprint`; `read_config_file` reads the TOML file (§5.4) |
+| `mpd_io.py` | shell | Pure parsers of python-mpd2 results, and `MpdIO`, a thin wrapper around the client (§5.2) |
+| `store.py` | shell | aiosqlite: migrations, the jukebox queue, play history, meta (§5.3) |
+| `runtime.py` | shell | `Refiller` (gathers refill inputs, drives the fold) and `Runtime` (the event loop and effect interpreter) (§5.1) |
+| `systemd.py` | shell | `notify`: `sd_notify` without libsystemd (§5.7) |
+| `cli.py` | shell | click entry points (§5.6) |
+| `migrations/` | data | Schema migrations as `NNNN_description.sql` files (§5.3.1) |
 
 ---
 
 ## 4. Functional core
 
-### 4.1 Data (all `@dataclass(frozen=True, slots=True)`, tuples and `frozenset`s, no lists or dicts)
+### 4.1 Data
+
+All data is frozen dataclasses (`@dataclass(frozen=True, slots=True)`),
+enums, tuples, frozensets and read-only mappings (`MappingProxyType`).
 
 ```python
-Tags = Mapping[str, tuple[str, ...]]      # MappingProxyType; tag name → values (multi-value)
+Tags = Mapping[str, tuple[str, ...]]      # lower-case tag name → values (multi-value)
 
-Song(uri: str, tags: Tags, duration: float, prio: int, last_modified: int, added: int)
-Album(key: str, first_uri: str, uris: tuple[str, ...], tags: Tags)  # tags merged across songs
-Entry(key: str, lineno: int, tag_value: str)   # one jukebox-queue item (URI or album key)
+Song(uri, tags, duration, prio, last_modified, added)
+Album(key, first_uri, uris, tags, last_modified, added)   # tags merged across songs
+Entry(key, lineno, tag_value)             # one jukebox-queue item: a song URI or an album key
 
-class Mode(Enum): SONG, ALBUM          # no OFF: the daemon only runs to be a jukebox
+Mode: SONG | ALBUM                        # no OFF: the daemon only runs to be a jukebox
+PlayState: PLAY | PAUSE | STOP
 
+Status(state: PlayState, queue_length, song_id, song_uri, elapsed, duration, crossfade)
+
+AlbumSettings(group_tag, use_mbid, unknown)                # §1.8
 Config(mode, playlist, queue_length, last_played_hours, uniq_tag, ignore_hated,
        filter_include, filter_exclude, min_song_duration, max_song_duration,
-       queue_length_song=100, queue_length_song_min=10,
-       queue_length_album=25, queue_length_album_min=5, add_max=99,
-       uniq_range=50, add_offset=10, last_played_count=2000,
-       album_group_tag=None, album_use_mbid=True, album_unknown=False,
-       write_stickers=False)
+       queue_length_song, queue_length_song_min,
+       queue_length_album, queue_length_album_min,
+       add_max, uniq_range, add_offset, last_played_count, write_stickers,
+       albums: AlbumSettings)
 
-Status(state: 'play'|'pause'|'stop', queue_length: int, song_id: int|None,
-       song_uri: str|None, elapsed: float, duration: float, crossfade: int)
-
-State(halted: bool,                     # set by a failed refill (§1.7) or endless failed adds; cleared only by Restart
-      jukebox_queue: tuple[Entry, ...],
+State(jukebox_queue: tuple[Entry, ...],
       filling: bool,                    # a refill is running
       enqueuing: bool,                  # an Enqueue is being carried out; no other run takes entries
       add_failures: int,                # failed adds since the last successful one
-      validating: bool, revalidate: bool,   # a database check is running / is due afterwards
+      validating: bool,                 # a database check is running
+      revalidate: bool,                 # another check is due when it (or a refill) finishes
+      halted: bool,                     # set by a failed refill (§1.7) or endless failed adds (§5.1); cleared only by Restart
       last_error: str,
-      status: Status | None)                  # last status seen; scrobble data comes from it
+      status: Status | None)            # last status seen; scrobble data comes from it
 ```
 
 The play history is not part of `State`. It lives only in the store, and the
@@ -351,54 +349,59 @@ fetches them and builds `queue_list` with the pure function
 `select_init`. The core decides *when* to refill and *how many* entries to
 pick. The shell gathers the inputs and runs the fold.
 
-### 4.3 Core functions (selection)
+### 4.3 Core functions
 
-```python
-# jukebox.py
-should_run(event, state) -> bool                # Connected/QueueChanged: qlen < queue_length; TimerFired: always; never while halted or filling
-add_count(cfg, mpd_qlen) -> int | None          # None = nothing to do; otherwise min(max(target-qlen, 1), add_max)
-needs_topup(cfg, jq_len) -> bool
-jukebox_timer(cfg, state, status) -> Effect     # SetTimer or CancelTimer (§1.3); CancelTimer while halted
-scrobble_timer(status, current) -> Effect
-take(jq, n) -> tuple[tuple[Entry,...], tuple[Entry,...]]
-run(cfg, state, now) -> (State, effects)        # §1.4
-update(cfg, state, event) -> (State, effects)   # dispatch on event type
+This lists what each part does, not full signatures; the code is the
+reference for those.
 
-# constraints.py: each returns Predicate[Candidate]
-duration_between(min_s, max_s); played_before(stickers, since); not_hated(likes, enabled)
-matches(include: Filter | None, exclude: Filter | None)
-uniq_against(queue_list, add_list) -> UniqResult   # IN_QUEUE | position | IS_UNIQ
-
-# select.py
-select_init(existing, expected, seed) -> Reservoir
-select_step(ctx, acc, cand) -> Reservoir         # one step of reservoir sampling, exactly as in §1.7
-select_result(acc) -> Filled(entries) | Short(found, expected)   # Short is a failure, as in myMPD
-
-# filters.py
-parse(expr: str) -> Filter | Invalid | Unsupported
-    # Invalid: syntax error; treated as "no filter", as in myMPD
-    # Unsupported: valid syntax using `~~`; parse_config turns this into a ConfigError
-evaluate(filter, tags_of: Callable[[str], tuple[str,...]], special) -> bool
-```
+- **`jukebox.py`.** `update` dispatches on the event type. `run` is myMPD's
+  `jukebox_run` (§1.4), using `add_count` (how many entries MPD's queue
+  needs, or none), `queue_size` and `needs_topup`. `jukebox_timer` and
+  `scrobble_timer` turn a `Status` into `SetTimer` or `CancelTimer` (§1.3,
+  §1.10). The handlers for `Enqueued` and `Validated` implement the
+  failed-add and database rules of §5.1.
+- **`constraints.py`.** `make_context` bundles the constraints for one
+  refill: durations, the last-played cut-off, the last-played map, hated
+  URIs, and the include/exclude predicate. `song_candidate` and
+  `album_candidate` apply them to one song or album and return a
+  `Candidate(key, tag_value)`, or `None`. `uniq_context` builds the
+  uniqueness context of §1.6 from the songs of MPD's queue and recent
+  history; `last_played_map` and `hated_uris` turn stickers (or the history)
+  into lookups.
+- **`select.py`.** `select_init(existing, expected, seed, uniq)` starts the
+  fold. `select_step(acc, candidate)` is one step of reservoir sampling,
+  exactly as in §1.7, with `None` for a candidate that failed the
+  constraints. `more_windows` decides whether to fetch the next result
+  window. `select_result` returns `Filled(entries)` or `Short(found,
+  expected)`; a short list is a failure, as in myMPD.
+- **`filters.py`.** `parse` returns a `Filter`, `Invalid` (a syntax error,
+  treated as "no filter", as in myMPD) or `Unsupported` (fuzzy `~~`, which
+  `parse_config` turns into a `ConfigError`). `evaluate(filter, subject)`
+  checks a song or album, and `predicate(include, exclude)` combines the two
+  filters, with exclude winning.
 
 ### 4.4 Randomness
 
 myMPD calls `randrange(0, n)` on a global RNG. We use a pure **SplitMix64**
 instead: `randrange(state, n) -> (k, state')`. The PRNG state is stored in
 `Reservoir`, and the initial seed is an argument. The shell draws seeds from
-`secrets.randbits(64)`. Tests pass fixed seeds and assert exact results.
+`secrets.randbits(64)`. Tests pass fixed seeds: the same seed gives the same
+picks, and a different seed gives different ones.
 
 ### 4.5 Performance
 
-- The reservoir is small (≤ about 1100 entries). It is held as a tuple and
-  replaced with a new tuple on each change, which costs O(k) per accepted
-  candidate.
-- Uniqueness keys from `queue_list` are precomputed once into frozensets, so
-  checking them is O(1). The `add_list` check is a scan, as in myMPD.
-- Library songs are streamed and never all held in memory, except in album
-  mode, where the album index is built per refill as an immutable mapping.
-  Keeping that index in memory between refills and invalidating it on idle
-  `database` is a possible later optimisation.
+- The reservoir is small (at most about 1100 entries). It is held as a tuple
+  and replaced with a new tuple on each change, which costs O(k) per
+  accepted candidate. Accepted candidates are rare once the reservoir is
+  full.
+- Uniqueness checks are set lookups: the keys and tag values of the
+  uniqueness context, and of the entries picked so far, are kept in
+  frozensets. myMPD scans its lists instead.
+- In song mode, library songs are streamed window by window and never all
+  held in memory. Album mode needs every song to build the album index. The
+  index is cached in the shell and rebuilt by each album refill and each
+  database check (§5.1), so a database update in album mode costs a full
+  library scan in the background.
 
 ---
 
@@ -407,9 +410,9 @@ instead: `randrange(state, n) -> (k, state')`. The PRNG state is stored in
 ### 5.1 Runtime (`runtime.py`)
 
 - One python-mpd2 `mpd.asyncio.MPDClient` connection. A background task
-  iterates `idle(['playlist', 'player', 'database'])`. python-mpd2's asyncio client sends
-  `noidle` by itself whenever another command is issued, and resumes idling
-  afterwards, so a second connection is not needed.
+  iterates `idle(['playlist', 'player', 'database'])`. python-mpd2's asyncio
+  client sends `noidle` by itself whenever another command is issued, and
+  resumes idling afterwards, so a second connection is not needed.
 - An `asyncio.Queue[Event]` collects events from the idle listener, the timers
   (`loop.call_later` handles keyed by name; `SetTimer` replaces an existing
   timer) and the refill task.
@@ -424,7 +427,7 @@ instead: `randrange(state, n) -> (k, state')`. The PRNG state is stored in
   rounds; if the jukebox queue runs out, it refills with the number still
   missing. If adds fail `queue_length_song` (or `queue_length_album`) times
   in a row, the jukebox halts instead of churning through picks forever.
-- **Database changes** (§7). On idle `database`, and on every connect, the
+- **Database changes** (§7.1). On idle `database`, and on every connect, the
   core asks the shell to `Validate` the jukebox queue. A background task
   checks each entry: `find file <uri>` in song mode, or membership in a
   rebuilt album index in album mode. The core then drops the missing
@@ -441,7 +444,7 @@ instead: `randrange(state, n) -> (k, state')`. The PRNG state is stored in
   the jukebox runs if MPD's queue is shorter than `queue_length`. A refill
   that was running is cancelled and `filling` is reset.
 - On SIGHUP: emit `Restart`. This is how to resume after a failed refill
-  halted the jukebox (§7), without restarting the process.
+  halted the jukebox (§7.2), without restarting the process.
 - On SIGINT/SIGTERM: cancel tasks, disconnect and exit with status 0. Every
   store write is its own transaction, so there is nothing to flush.
 
@@ -457,9 +460,10 @@ instead: `randrange(state, n) -> (k, state')`. The PRNG state is stored in
     otherwise one unwindowed call.
   - Include and exclude are **always** also evaluated locally, as in myMPD.
 - Album source: read every song with windowed `search file ""` calls, then
-  group them with the pure `albums.build_albums`. The index is cached until
-  the next album refill. If a saved album key is missing from it (after a
-  daemon restart, for example), it is rebuilt once.
+  group them with the pure `albums.build_albums`. The index is cached in
+  `Refiller` and rebuilt by each album refill and each database check. If
+  an album to be added is missing from it (after a daemon restart, for
+  example), it is rebuilt once.
 - Stickers: `sticker find song "" lastPlayed` and `sticker find song "" like`
   become immutable `Mapping[uri, str]`. If stickers are unavailable (MPD
   answers "unknown command" or there is no sticker DB), these are empty and
@@ -469,8 +473,8 @@ instead: `randrange(state, n) -> (k, state')`. The PRNG state is stored in
 - `Enqueue` for albums: the shell looks up the album and runs `add` for each
   of its URIs, sorted by (disc, track, uri). python-mpd2's asyncio client
   has no command lists, so these are separate `add` commands. An album counts
-  as added if at least one of its songs was added. myMPD uses `searchadd`; see
-  §7.
+  as added if at least one of its songs was added. myMPD uses `searchadd`
+  (§7.1).
 
 ### 5.3 Persistence (`store.py`, aiosqlite)
 
@@ -483,7 +487,7 @@ The initial schema (`migrations/0001_initial.sql`):
 CREATE TABLE meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
-);  -- 'mode', 'constraint_fingerprint'
+);  -- 'constraint_fingerprint'
 
 CREATE TABLE jukebox_queue (
     pos       INTEGER PRIMARY KEY,
@@ -499,10 +503,11 @@ CREATE TABLE history (
 );  -- capped at last_played_count
 ```
 
-- `constraint_fingerprint` is a pure hash of the config fields from §1.10. On
-  startup, a saved jukebox queue is discarded if the fingerprint or the mode
-  differs. This combines myMPD's mode check on load with its clear-on-change
-  rule.
+- `constraint_fingerprint` is a pure hash of the settings that decide what
+  may be picked: the mode, the constraints of §1.10 and the `[albums]`
+  table. On startup, a saved jukebox queue is discarded if the fingerprint
+  differs. This covers both myMPD's mode check on load and its
+  clear-on-change rule.
 - `Persist` rewrites `jukebox_queue` in one transaction. The queue holds at
   most about 1100 rows, so a full rewrite is cheap.
 - The schema version is not kept in `meta`. It is SQLite's built-in
@@ -638,8 +643,8 @@ unknown = false
 
 `parse_config(raw: Mapping) -> Settings` is pure and raises `ConfigError`.
 `Settings` holds the `Config`, the parsed filters, the `[mpd]` table, the
-state file path and any warnings. It validates
-the value ranges from §1.1 and the tag names. It also runs `filters.parse` on
+state file path and any warnings. It validates the value ranges from §1.1
+and the tag names. It also runs `filters.parse` on
 `filter_include` and `filter_exclude`: a filter that uses fuzzy `~~` is a
 `ConfigError`, and the daemon refuses to start. A filter with a syntax error
 only logs a warning and is ignored, as in myMPD.
@@ -653,8 +658,8 @@ treats a host containing `/` as a Unix socket path and a host starting with
 `@` as an abstract socket.
 
 **`parse_mpd_host(value: str) -> (host, password | None)`** (pure; raises
-`ConfigError`). It follows
-libmpdclient's `mpd_parse_host_password` (`dist/libmpdclient/src/settings.c`):
+`ConfigError`). It follows libmpdclient's `mpd_parse_host_password`
+(`dist/libmpdclient/src/settings.c`):
 
 | `MPD_HOST` | host | password |
 |---|---|---|
@@ -682,8 +687,7 @@ Rules:
 supported.
 
 **`resolve_connection(cli, config, env) -> Connection`** (pure; raises
-`ConfigError`;
-the shell passes in `os.environ` as a plain mapping).
+`ConfigError`; the shell passes in `os.environ` as a plain mapping).
 
 - **Host and password** come from the highest-priority source that sets a
   host: `--host`, then `[mpd].host`, then `MPD_HOST`, then the default
@@ -734,11 +738,8 @@ on every reconnect.
 Global options: `--config`, `--debug` (debug output from this program and
 python-mpd2 only), `--state` (the state database; also the top-level
 `state_file` key in the config file), `--host`, `--port` and `--password`
-(§5.5). On the command line,
-`--password` is visible in the process list, so `MPD_HOST` or the config
-file is the better place for a password.
-
----
+(§5.5). On the command line, `--password` is visible in the process list,
+so `MPD_HOST` or the config file is the better place for a password.
 
 ### 5.7 systemd and NixOS (`nixos/module.nix`)
 
@@ -762,7 +763,8 @@ The NixOS module `services.mpd-jukebox`:
 - The service runs with `DynamicUser`, `StateDirectory=mpd-jukebox` (the state
   database is `/var/lib/mpd-jukebox/state.sqlite`) and systemd hardening:
   `ProtectSystem=strict`, no capabilities, only `AF_UNIX`/`AF_INET`/`AF_INET6`
-  sockets and the `@system-service` system calls. `ExecReload` sends SIGHUP. It is ordered
+  sockets and the `@system-service` system calls. `ExecReload` sends SIGHUP.
+  It is ordered
   after `mpd.service` (or `mpd.socket`) when the local MPD is enabled, and it
   restarts on failure after 10 s.
 
@@ -778,35 +780,43 @@ runs two machines with a real MPD, a null audio output and 90 generated
 - `socket`: album mode over a Unix socket; whole albums are queued in track
   order.
 
+The `tcp` machine's music is a writable copy, so the test can also change the
+library under the jukebox: a picked song deleted while it runs is dropped
+after `mpc update`, and a pick deleted while it is stopped is skipped when
+its turn comes.
+
+---
+
 ## 6. Testing
 
-- The test style follows the existing setup: `unittest` run by pytest, with
-  `--cov-fail-under=95`, mypy, and ruff (format and lint).
-- **Core.** Plain unit tests over the data, with no mocks. Examples:
-  - `select_step` with a fixed seed against hand-computed reservoirs;
-  - a property-style check that, over many seeds, picks never break
-    uniqueness and never touch pre-existing entries;
-  - the trigger table from §1.4 (`qlen > target`, `== target` adds one,
-    `< target`, the 99 cap);
-  - the timer arithmetic from §1.3;
-  - filter parse and evaluate cases taken from myMPD semantics;
-  - album keys with and without MBID;
-  - the `update()` event sequences: connect→refill→enqueue→play; connect
-    with a queue that is already long enough does nothing; a refill failure
-    halts the jukebox and `Restart` resumes it; `filling` blocks re-entry.
-- **Shell.** A fake MPD client (an in-memory object with the same async
-  methods) and a temporary SQLite file. The runtime is tested with scripted
-  event sequences.
-- **MPD address and password.**
-  - Every row of the `parse_mpd_host` table in §5.5, plus a bad `MPD_PORT`.
-  - Precedence in `resolve_connection`.
-  - A password in `MPD_HOST` is not used when the host comes from the config
-    file.
-  - A conflicting password in the same source is an error.
-  - `repr(Connection)` does not contain the password.
-  - With the fake MPD client: `password` is the first command on both
-    connections and again after a reconnect; a wrong password makes the run
-    exit with an error instead of reconnecting.
+`unittest` test cases run by pytest, which also runs mypy, ruff (lint and
+format) and coverage, with `--cov-fail-under=95`. The package build runs the
+same suite, and `nix flake check` adds the VM test of §5.7.
+
+- **Core.** Plain unit tests over the data, with no mocks:
+  - the trigger rules of §1.4 (`qlen > target`, `== target` adds one,
+    `< target`, the 99 cap) and the timer arithmetic of §1.3;
+  - `update()` event sequences: connect, refill, enqueue, play; a refill
+    failure halts and `Restart` resumes; failed adds are replaced by the next
+    entries, a run with no entries left refills, and endless failures halt;
+    `filling` and `enqueuing` block other runs; database checks drop missing
+    entries and are repeated after a change during a check or refill;
+  - the selection fold with fixed seeds: deterministic, uniqueness never
+    broken over many seeds, pre-existing entries never touched, a short
+    result is a failure;
+  - filter parsing and evaluation, following myMPD's semantics; album keys
+    with and without MBID; tag helpers and normalisation.
+- **Shell.** A fake MPD client (`tests/fake_mpd.py`, an in-memory object
+  with the same async methods) and a temporary SQLite file. The runtime is
+  tested end to end against it: filling and playing, saved queues, halting
+  and restarting, reconnects, password handling, album mode, playlist
+  sources, failed adds, stale saved entries and database changes.
+- **MPD address and password.** Every row of the `parse_mpd_host` table in
+  §5.5, a bad `MPD_PORT`, precedence, a password in `MPD_HOST` not being
+  sent to a host from the config file, conflicting passwords,
+  `password_file`, and `repr(Connection)` hiding the password. With the fake
+  client: `password` is the first command, also after a reconnect, and a
+  wrong password ends the run instead of reconnecting.
 - **Migrations.**
   - Every shipped file has a valid name and splits into at least one
     statement.
@@ -816,56 +826,65 @@ runs two machines with a real MPD, a null audio output and 90 generated
   - `pending()` handles a fresh database, a partially upgraded one, an
     up-to-date one and a too-new one.
   - Upgrading twice does nothing the second time.
-  - **Schema equivalence:** for every N, a database created at version N and
-    then upgraded ends with the same schema (`sqlite_master`) as a fresh
-    database at the latest version.
+  - **Schema equivalence:** a database upgraded step by step ends with the
+    same schema (`sqlite_master`) as a fresh database at the latest version.
   - A migration that fails part-way leaves `user_version` and the tables
     unchanged.
   - The read-only reader refuses a database whose version doesn't match.
+- **systemd.** `notify` with a path socket, an abstract socket (Linux only),
+  an unreachable socket, and outside systemd.
 
 ---
 
-## 7. Deviations from myMPD and decisions
+## 7. myMPD compatibility
 
-1. **Album enqueue** uses the URIs collected in our album index instead of
-   `searchadd` with an album expression. The result is the same unless the
-   database changes between refill and enqueue. In that case a missing URI
-   fails and is logged, as a failed `add` is in song mode.
-2. **Fuzzy `~~`** is not implemented. A filter that uses it is a config
-   error, and the daemon refuses to start (*decided*). myMPD would run the
-   fuzzy match. Other syntax errors keep myMPD's behaviour: the filter is
-   ignored and a warning is logged.
-3. **Last-played fallback.** If MPD has no sticker DB, our own history table
-   provides the last-played timestamps. myMPD would skip the constraint in
-   this case.
-4. **Refill shortfall halts the jukebox**, as in myMPD. With strict filters
-   or a small library, this happens as soon as fewer than
-   `queue_length_song + add` candidates match. *Decided:* match myMPD. myMPD
-   sets `mode = off`. We have no `off` mode, so the core sets `halted` and
-   stores `last_error`. The daemon keeps running and keeps recording play
-   history, but adds nothing until SIGHUP (`Restart`) or a process restart.
-5. **Quirks kept on purpose:** empty uniq-tag values collide with each other;
-   with `uniq_tag == Title`, the context entries carry `""`; album mode
-   computes `add` from the song count; duration bounds are strict.
-6. **Lua scripting (`script` mode), MPD partitions, presets and the API**
-   are not supported (§2).
-7. **No `off` mode and no `autostart`** (*decided*). Running the daemon means
-   the jukebox is on; to turn it off, stop the daemon. On connect, myMPD runs
-   the jukebox only if `autostart` is set and the queue is empty. We run it
+### 7.1 Deviations from myMPD
+
+1. **No `off` mode and no `autostart`.** Running the daemon means the jukebox
+   is on; to turn it off, stop the daemon. On connect, myMPD runs the
+   jukebox only if `autostart` is set and the queue is empty. We run it
    whenever the queue is shorter than `queue_length`, the same rule as a
-   queue change. One consequence: if the daemon starts (or MPD restarts)
-   with a short queue, it adds songs and starts playback straight away.
-8. **Filter details.** `file` takes MPD's `(file == 'uri')` syntax; myMPD's
-   parser cannot parse that form. Dates in `modified-since` and `added-since`
-   are read as UTC, where myMPD uses local time. Unicode normalisation
-   approximates utf8proc with NFKD, case folding and removal of combining
-   marks.
-9. **Album tags** are merged across the album's songs: each tag keeps its
+   queue change. So if the daemon starts (or MPD restarts) with a short
+   queue, it adds songs and starts playback straight away.
+2. **Fuzzy `~~` is not implemented.** A filter that uses it is a config
+   error, and the daemon refuses to start; myMPD would run the fuzzy match.
+   Other syntax errors keep myMPD's behaviour: the filter is ignored and a
+   warning is logged.
+3. **Filter details.** `file` takes MPD's `(file == 'uri')` syntax; myMPD's
+   parser cannot parse that form. Dates in `modified-since` and
+   `added-since` are read as UTC, where myMPD uses local time. Unicode
+   normalisation approximates utf8proc with NFKD, case folding and removal
+   of combining marks.
+4. **Last-played fallback.** If MPD has no sticker database, our own history
+   table provides the last-played timestamps. myMPD skips the constraint in
+   this case.
+5. **Album enqueue** adds the URIs collected in our album index, one `add`
+   per song, instead of `searchadd` with an album expression. An album
+   counts as added if at least one of its songs was added.
+6. **Album tags** are merged across the album's songs: each tag keeps its
    distinct values in order of first appearance. `last_modified` is the
    newest and `added` the oldest of its songs, as in myMPD.
-10. **Picks are checked against database changes.** myMPD keeps its jukebox
-    queue until it is used up, so songs removed or renamed in the library
-    (for example a CUE image split into tracks) fail when their turn comes
-    and are skipped then. We also skip them, as myMPD does, but in addition
-    drop them as soon as MPD reports a database change, or on connect, when
-    the database may have changed while we were away (§5.1).
+7. **Picks are checked against database changes.** myMPD keeps its jukebox
+   queue until it is used up, so songs removed or renamed in the library
+   (for example a CUE image split into tracks) fail when their turn comes
+   and are skipped then. We skip them too, but also drop them as soon as
+   MPD reports a database change, and on connect, when the database may have
+   changed while we were away (§5.1).
+8. **Endless failed adds halt the jukebox.** If adds fail
+   `queue_length_song` (or `queue_length_album`) times in a row, the jukebox
+   halts like after a failed refill, instead of working through its picks
+   and refilling forever. myMPD has no such limit.
+
+### 7.2 Kept as in myMPD, on purpose
+
+- **A short refill halts the jukebox.** With strict filters or a small
+  library, this happens as soon as fewer than `queue_length_song + add`
+  candidates match. myMPD sets `mode = off`; we have no `off` mode, so the
+  core sets `halted` and stores `last_error`. The daemon keeps running and
+  keeps recording play history, but adds nothing until SIGHUP (`Restart`)
+  or a process restart.
+- **Failed adds are replaced** by the next entries of the jukebox queue
+  until the wanted number is in MPD's queue (§1.5, §5.1).
+- **Quirks:** empty uniq-tag values collide with each other; with
+  `uniq_tag == Title`, the context entries carry `""`; album mode computes
+  `add` from the song count; duration bounds are strict.
