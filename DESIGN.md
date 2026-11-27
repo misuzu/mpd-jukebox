@@ -262,7 +262,7 @@ inputs the fold always produces the same result.
 | `rng.py` | core | Pure SplitMix64: `next_u64`, `randrange` (§4.4) |
 | `tags.py` | core | Tag names, values and normalisation; `album_key(tags, settings)` (§1.8) |
 | `filters.py` | core | Parser and evaluator for filter expressions (§1.9) |
-| `albums.py` | core | `build_albums`: songs grouped into an album index |
+| `albums.py` | core | `build_albums`: songs grouped into an album index, optionally by directory (§7.1) |
 | `constraints.py` | core | Selection inputs and constraints: `make_context`, `song_candidate`, `album_candidate`, `uniq_context`, last-played and hated maps (§1.6, §1.7) |
 | `select.py` | core | The selection fold: `select_init`, `select_step`, `more_windows`, `select_result` (§1.7) |
 | `jukebox.py` | core | `State`, events, effects and `update()`: trigger rules, moving entries to MPD, refills, validation, timers, scrobbles (§4.2) |
@@ -297,7 +297,7 @@ PlayState: PLAY | PAUSE | STOP
 
 Status(state: PlayState, queue_length, song_id, song_uri, elapsed, duration, crossfade)
 
-AlbumSettings(group_tag, use_mbid, unknown)                # §1.8
+AlbumSettings(group_tag, use_mbid, unknown, split_by_directory)  # §1.8, §7.1
 Config(mode, playlist, queue_length, last_played_hours, uniq_tag, ignore_hated,
        filter_include, filter_exclude, min_song_duration, max_song_duration,
        queue_length_song, queue_length_song_min,
@@ -407,8 +407,9 @@ the `lastPlayed` stickers of 8,400 played songs, about 380 bytes per
   for only the tags this configuration reads (`tagtypes clear`, then
   `tagtypes enable …`; `needed_tags`): the uniq tag (and `name` for
   `Title`), the tags in the filters, and in album mode the album-key tags
-  and disc and track. A filter using `any` keeps all tags. File names,
-  durations and dates are always sent, so this saves the tag part only: on
+  and disc and track (and title with `split_by_directory`). A filter using
+  `any` keeps all tags. File names, durations and dates are always sent,
+  so this saves the tag part only: on
   the library above, a song-mode read with `uniq_tag = "Album"` drops from
   20 MB to 14 MB, an album-mode read to 17 MB. An MPD without `tagtypes
   clear` (before 0.21) sends everything.
@@ -757,6 +758,7 @@ write_stickers = false     # write playCount/lastPlayed like myMPD (turn off if 
 group_tag = ""             # e.g. "Date"
 use_mbid = true
 unknown = false
+split_by_directory = false # an album is one folder (with discs): copies elsewhere are left out (§7.1)
 ```
 
 `parse_config(raw: Mapping) -> Settings` is pure and raises `ConfigError`.
@@ -1014,6 +1016,46 @@ same suite, and `nix flake check` adds the VM test of §5.7.
    `queue_length_song` (or `queue_length_album`) times in a row, the jukebox
    halts like after a failed refill, instead of working through its picks
    and refilling forever. myMPD has no such limit.
+9. **Albums by directory** (`[albums] split_by_directory`, off by
+   default). myMPD groups songs by album key alone, so copies of an
+   album's songs elsewhere in the library (loose downloads with the same
+   Artist, Album and Date tags, or a second edition of the album) join it
+   and are added with it, interleaved by track number. With the option on,
+   the songs of a key are split into candidate albums by folder, and the
+   candidate with the most songs is the album; a tie goes to the first by
+   directory. The others are left out of the index. The key stays the same,
+   so nothing else changes: a stray copy in MPD's queue still counts as its
+   album for uniqueness, as in myMPD.
+
+   Folders are parts of one album, rather than copies of it, if no song
+   title (normalised as in filters) appears in both, or if every song has
+   a Disc tag and the Disc numbers tell them apart. With that test
+   (`albums._distinct`):
+   - **Folders.** MPD lists the tracks of a CUE sheet, or of an embedded
+     one, as `dir/image.cue/track0001`; they count as being in `dir`, the
+     folder holding the sheet. Songs start out grouped by folder.
+   - **Discs.** Sibling folders (`Album/CD1/`, `Album/CD2/`) are discs of
+     one album in their parent if every two of them pass the test.
+     Otherwise, for editions side by side (`Artist/Album (EU)/`,
+     `Artist/Album (JP)/`) or `lossless/` next to `lossy/`, each is a
+     candidate of its own. Folders directly below the library root are
+     never discs, so download folders do not combine.
+   - **Bonus discs.** Deepest first, a candidate joins the closest
+     candidate in a folder above it (or in the same one) if the two pass
+     the test: a bonus disc in a subfolder of the album, or `Album/Extras/`
+     with its own subfolders. A copy of a song in the artist folder above
+     the album does not join. The library root takes nothing in.
+
+   Songs are ordered by disc, directory (the CUE sheet, for its tracks),
+   track and URI, so disc folders and sheets without Disc tags play in
+   order. The test needs titles, so the connection also asks MPD for
+   `title` (§4.5). On a library of 58,000 songs and 9,300 album keys,
+   building the index takes about 0.9 s instead of 0.7 s.
+
+   Limits: an album that repeats a title across disc folders without Disc
+   tags splits into its discs, the largest kept; a stray song that shares
+   no title with the album (another song tagged with its album name) in a
+   sibling folder joins it as a disc.
 
 ### 7.2 Kept as in myMPD, on purpose
 

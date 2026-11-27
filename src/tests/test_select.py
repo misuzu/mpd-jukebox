@@ -250,6 +250,13 @@ class NeededTagsTestCase(unittest.TestCase):
         assert tags is not None
         self.assertIn('date', tags)
         self.assertNotIn('musicbrainz_albumid', tags)
+        self.assertNotIn('title', tags)
+        cfg = Config(
+            mode=Mode.ALBUM, albums=AlbumSettings(split_by_directory=True)
+        )
+        tags = needed_tags(cfg, None, None)
+        assert tags is not None
+        self.assertIn('title', tags)
 
     def test_filters(self):
         tags = needed_tags(

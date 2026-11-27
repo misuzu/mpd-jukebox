@@ -49,6 +49,7 @@ class ParseConfigTestCase(unittest.TestCase):
                     'group_tag': 'Date',
                     'use_mbid': False,
                     'unknown': True,
+                    'split_by_directory': True,
                 },
             }
         )
@@ -57,6 +58,7 @@ class ParseConfigTestCase(unittest.TestCase):
         self.assertEqual(cfg.uniq_tag, 'album')
         self.assertEqual(cfg.albums.group_tag, 'date')
         self.assertFalse(cfg.albums.use_mbid)
+        self.assertTrue(cfg.albums.split_by_directory)
         self.assertTrue(cfg.write_stickers)
         self.assertIsInstance(settings.include, Filter)
         self.assertIsInstance(settings.exclude, Filter)
@@ -81,6 +83,7 @@ class ParseConfigTestCase(unittest.TestCase):
             {'jukebox': {'filter_include': "(Artist ~~ 'x')"}},
             {'jukebox': {'filter_exclude': "(Artist ~~ 'x')"}},
             {'albums': {'group_tag': 'nope'}},
+            {'albums': {'split_by_directory': 'yes'}},
             {'state_file': 5},
         ]
         for raw in cases:
@@ -99,6 +102,8 @@ class ParseConfigTestCase(unittest.TestCase):
         c = parse_config({'jukebox': {'uniq_tag': 'Album'}}).config
         self.assertEqual(fingerprint(a), fingerprint(b))
         self.assertNotEqual(fingerprint(a), fingerprint(c))
+        d = parse_config({'albums': {'split_by_directory': True}}).config
+        self.assertNotEqual(fingerprint(a), fingerprint(d))
 
 
 class ReadConfigFileTestCase(unittest.TestCase):

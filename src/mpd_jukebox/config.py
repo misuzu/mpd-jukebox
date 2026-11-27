@@ -46,7 +46,9 @@ _ADVANCED_KEYS = frozenset(
         'write_stickers',
     }
 )
-_ALBUM_KEYS = frozenset({'group_tag', 'use_mbid', 'unknown'})
+_ALBUM_KEYS = frozenset(
+    {'group_tag', 'use_mbid', 'unknown', 'split_by_directory'}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,6 +189,7 @@ def parse_config(raw: Mapping[str, Any]) -> Settings:
             else None,
             use_mbid=_bool(album, 'use_mbid', True, al),
             unknown=_bool(album, 'unknown', False, al),
+            split_by_directory=_bool(album, 'split_by_directory', False, al),
         ),
     )
 
@@ -231,6 +234,7 @@ def fingerprint(config: Config) -> str:
         'album_group_tag': config.albums.group_tag,
         'album_use_mbid': config.albums.use_mbid,
         'album_unknown': config.albums.unknown,
+        'album_split_by_directory': config.albums.split_by_directory,
     }
     encoded = json.dumps(fields, sort_keys=True).encode()
     return hashlib.sha256(encoded).hexdigest()

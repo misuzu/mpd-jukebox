@@ -1,8 +1,8 @@
 import unittest
 
 from mpd_jukebox import rng
-from mpd_jukebox.albums import build_albums
-from mpd_jukebox.model import AlbumSettings
+from mpd_jukebox.albums import album_parts, build_albums, folder
+from mpd_jukebox.model import AlbumSettings, Song
 from mpd_jukebox.tags import (
     album_key,
     basename,
@@ -167,6 +167,225 @@ class BuildAlbumsTestCase(unittest.TestCase):
         ]
         (album,) = build_albums(songs, AlbumSettings()).values()
         self.assertEqual((album.last_modified, album.added), (7, 3))
+
+
+class SplitByDirectoryTestCase(unittest.TestCase):
+    SPLIT = AlbumSettings(split_by_directory=True)
+
+    def titled(self, uri: str, title: str, disc: str = '') -> Song:
+        if disc:
+            return song(uri, artist='A', album='Album', title=title, disc=disc)
+        return song(uri, artist='A', album='Album', title=title)
+
+    def parts(self, *songs: Song) -> list[tuple[str, list[str]]]:
+        return [
+            (home, sorted(s.uri for s in part))
+            for home, part in album_parts(songs)
+        ]
+
+    def test_one_folder(self):
+        self.assertEqual(
+            self.parts(
+                self.titled('A/Album/01.mp3', 'One'),
+                self.titled('A/Album/02.mp3', 'Two'),
+            ),
+            [('A/Album', ['A/Album/01.mp3', 'A/Album/02.mp3'])],
+        )
+
+    def test_disc_folders(self):
+        self.assertEqual(
+            self.parts(
+                self.titled('A/Double/CD1/01.mp3', 'One'),
+                self.titled('A/Double/CD2/01.mp3', 'Two'),
+            ),
+            [('A/Double', ['A/Double/CD1/01.mp3', 'A/Double/CD2/01.mp3'])],
+        )
+
+    def test_copies_side_by_side_are_not_discs(self):
+        self.assertEqual(
+            self.parts(
+                self.titled('A/Album (EU)/01.mp3', 'One'),
+                self.titled('A/Album (EU)/02.mp3', 'Two'),
+                self.titled('A/Album (JP)/01.mp3', 'one'),
+                self.titled('A/Album (JP)/02.mp3', 'Two'),
+                self.titled('A/Album (JP)/03.mp3', 'Bonus'),
+            ),
+            [
+                (
+                    'A/Album (EU)',
+                    ['A/Album (EU)/01.mp3', 'A/Album (EU)/02.mp3'],
+                ),
+                (
+                    'A/Album (JP)',
+                    [
+                        'A/Album (JP)/01.mp3',
+                        'A/Album (JP)/02.mp3',
+                        'A/Album (JP)/03.mp3',
+                    ],
+                ),
+            ],
+        )
+
+    def test_disc_tags_tell_discs_with_shared_titles_apart(self):
+        parts = self.parts(
+            self.titled('A/Live/CD1/01.mp3', 'Intro', '1'),
+            self.titled('A/Live/CD2/01.mp3', 'Intro', '2'),
+        )
+        self.assertEqual([home for home, _ in parts], ['A/Live'])
+        # Without Disc tags on every song, shared titles mean copies.
+        parts = self.parts(
+            self.titled('A/Live/CD1/01.mp3', 'Intro', '1'),
+            self.titled('A/Live/CD2/01.mp3', 'Intro'),
+        )
+        self.assertEqual(
+            [home for home, _ in parts], ['A/Live/CD1', 'A/Live/CD2']
+        )
+
+    def test_top_level_folders_are_never_discs(self):
+        parts = self.parts(
+            self.titled('Inbox/x.mp3', 'One'),
+            self.titled('Inbox 2/y.mp3', 'Two'),
+        )
+        self.assertEqual([home for home, _ in parts], ['Inbox', 'Inbox 2'])
+
+    def test_bonus_disc_in_a_subfolder_joins_the_album(self):
+        parts = self.parts(
+            self.titled('A/Album/01.mp3', 'One'),
+            self.titled('A/Album/Bonus/01.mp3', 'One (Instrumental)'),
+            self.titled('A/Album/Extras/Mixes/01.mp3', 'One (Extended)'),
+            self.titled('A/Album/Extras/Tracks/01.mp3', 'One (Backing)'),
+        )
+        self.assertEqual(
+            parts,
+            [
+                (
+                    'A/Album',
+                    [
+                        'A/Album/01.mp3',
+                        'A/Album/Bonus/01.mp3',
+                        'A/Album/Extras/Mixes/01.mp3',
+                        'A/Album/Extras/Tracks/01.mp3',
+                    ],
+                )
+            ],
+        )
+
+    def test_copy_in_a_parent_folder_stays_apart(self):
+        parts = self.parts(
+            self.titled('A/single.mp3', 'One'),
+            self.titled('A/Album/01.mp3', 'One'),
+            self.titled('A/Album/02.mp3', 'Two'),
+        )
+        self.assertEqual([home for home, _ in parts], ['A', 'A/Album'])
+
+    def test_library_root_takes_nothing_in(self):
+        parts = self.parts(
+            self.titled('loose.mp3', 'Other'),
+            self.titled('A/Album/01.mp3', 'One'),
+        )
+        self.assertEqual([home for home, _ in parts], ['', 'A/Album'])
+
+    def tracks(self, *uris: str) -> list[Song]:
+        # The track number is the file name.
+        return [
+            song(uri, artist='A', album='Album', track=uri[-6:-4])
+            for uri in uris
+        ]
+
+    def test_stray_copies_are_left_out(self):
+        songs = self.tracks(
+            'Inbox/01.mp3',
+            'A/Album/01.mp3',
+            'A/Album/02.mp3',
+            'Inbox 2/03.mp3',
+            'A/Album/04.mp3',
+        ) + [song('B/Other/01.mp3', artist='B', album='Other')]
+        merged = build_albums(songs, AlbumSettings())
+        albums = build_albums(songs, self.SPLIT)
+        self.assertEqual(list(albums), list(merged))
+        self.assertEqual(
+            sorted(a.uris for a in albums.values()),
+            [
+                ('A/Album/01.mp3', 'A/Album/02.mp3', 'A/Album/04.mp3'),
+                ('B/Other/01.mp3',),
+            ],
+        )
+
+    def test_disc_folders_count_together(self):
+        songs = self.tracks(
+            'A/Double/CD2/01.mp3',
+            'A/Double/CD1/02.mp3',
+            'A/Double/CD1/01.mp3',
+            'Inbox/01.mp3',
+            'Inbox/02.mp3',
+        )
+        (album,) = build_albums(songs, self.SPLIT).values()
+        # Ordered by folder, so discs without Disc tags play in order.
+        self.assertEqual(
+            album.uris,
+            (
+                'A/Double/CD1/01.mp3',
+                'A/Double/CD1/02.mp3',
+                'A/Double/CD2/01.mp3',
+            ),
+        )
+
+    def test_folder(self):
+        self.assertEqual(folder('A/Album/01.mp3'), 'A/Album')
+        self.assertEqual(folder('A/Album/track01.mp3'), 'A/Album')
+        self.assertEqual(folder('A/Album/image.cue/track0001'), 'A/Album')
+        self.assertEqual(folder('A/Album/image.flac/track0012'), 'A/Album')
+        self.assertEqual(folder('image.cue/track0001'), '')
+        self.assertEqual(folder('loose.mp3'), '')
+
+    def cue(self, *tracks: tuple[str, int]) -> list[Song]:
+        return [
+            song(
+                f'{sheet}/track{n:04}', artist='A', album='Album', track=str(n)
+            )
+            for sheet, n in tracks
+        ]
+
+    def test_cue_sheets_in_disc_folders(self):
+        songs = self.cue(
+            ('A/Double/Disc 2/image.cue', 1),
+            ('A/Double/Disc 1/image.cue', 2),
+            ('A/Double/Disc 1/image.cue', 1),
+            ('Inbox/image.cue', 1),
+            ('Inbox/image.cue', 2),
+        )
+        (album,) = build_albums(songs, self.SPLIT).values()
+        self.assertEqual(
+            album.uris,
+            (
+                'A/Double/Disc 1/image.cue/track0001',
+                'A/Double/Disc 1/image.cue/track0002',
+                'A/Double/Disc 2/image.cue/track0001',
+            ),
+        )
+
+    def test_cue_sheets_in_one_folder(self):
+        songs = self.cue(
+            ('A/Double/CD 2.cue', 1),
+            ('A/Double/CD 1.cue', 2),
+            ('A/Double/CD 1.cue', 1),
+            ('Inbox/x.cue', 1),
+        )
+        (album,) = build_albums(songs, self.SPLIT).values()
+        # One folder, but ordered by sheet, so the discs do not interleave.
+        self.assertEqual(
+            album.uris,
+            (
+                'A/Double/CD 1.cue/track0001',
+                'A/Double/CD 1.cue/track0002',
+                'A/Double/CD 2.cue/track0001',
+            ),
+        )
+
+    def test_tie_goes_to_the_first_directory(self):
+        songs = self.tracks('B/Album/01.mp3', 'A/Album/01.mp3')
+        (album,) = build_albums(songs, self.SPLIT).values()
+        self.assertEqual(album.uris, ('A/Album/01.mp3',))
 
 
 class ModelTestCase(unittest.TestCase):

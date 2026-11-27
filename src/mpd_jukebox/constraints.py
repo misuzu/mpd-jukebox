@@ -71,6 +71,8 @@ def needed_tags(
             tags.add('musicbrainz_albumid')
         if cfg.albums.group_tag is not None:
             tags.add(cfg.albums.group_tag)
+        if cfg.albums.split_by_directory:
+            tags.add('title')  # tells disc folders from copies (albums.py)
     for flt in (include, exclude):
         if flt is not None:
             used = tags_used(flt)

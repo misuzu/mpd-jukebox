@@ -82,6 +82,7 @@ class AlbumSettings:
     group_tag: str | None = None
     use_mbid: bool = True
     unknown: bool = False
+    split_by_directory: bool = False
 
 
 @dataclass(frozen=True, slots=True)

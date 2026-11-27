@@ -124,6 +124,7 @@ write_stickers = false      # write playCount and lastPlayed like myMPD
 group_tag = ""              # also split albums by this tag, e.g. "Date"
 use_mbid = true             # identify albums by MusicBrainz album ID
 unknown = false             # songs without an Album tag form "Unknown Album"
+split_by_directory = false  # an album is one folder; copies elsewhere are left out
 ```
 
 ```sh
@@ -141,7 +142,14 @@ discards the songs picked in advance at the next start, as myMPD does.
   plays are counted twice.
 - **Album mode** adds whole albums in disc and track order, and counts
   albums: with `queue_length = 2` and an empty queue, it adds two albums.
-  It ignores `playlist`, the song durations and `ignore_hated`.
+  It ignores `playlist`, the song durations and `ignore_hated`. Like
+  myMPD, it groups songs into albums by tags (MusicBrainz album ID, or
+  AlbumArtist and Album), so stray copies of an album's songs elsewhere in
+  the library are added with it. With `split_by_directory`, an album is
+  one folder, with its disc and bonus-disc subfolders; of the folders
+  holding an album's songs, the one with the most is used, and stray
+  copies and other editions are left out. Folders count as parts of one
+  album when they share no song title (DESIGN.md §7.1).
 - **Filters** use myMPD's subset of MPD's filter syntax: clauses joined
   with `AND`, each `(TAG OP 'value')` with `==`, `!=`, `contains`,
   `starts_with`, `=~` or `!~` (regular expressions). `any`, `file ==`,
