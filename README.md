@@ -126,6 +126,7 @@ use_mbid = true             # identify albums by MusicBrainz album ID
 unknown = false             # songs without an Album tag form "Unknown Album"
 split_by_directory = false  # an album is one folder; copies elsewhere are left out
 compilations = false        # no AlbumArtist, one folder, many artists: one album
+merge_discs = false         # "Album (CD 1)", "Album - Disc 2": one album "Album"
 ```
 
 ```sh
@@ -157,6 +158,9 @@ discards the songs picked in advance at the next start, as myMPD does.
   one folder with the same Album tag, several artists and distinct track
   numbers form one album, as if tagged AlbumArtist "Various Artists".
   Tagging AlbumArtist is still the better fix where you can.
+  With `merge_discs`, discs tagged as separate albums ("Album (CD 1)",
+  "Album [Disc 2]", "Album - Disc 3", "Album CD2 Bonus Disc") form one
+  album "Album". Volumes and parts stay separate.
 - **Filters** use myMPD's subset of MPD's filter syntax: clauses joined
   with `AND`, each `(TAG OP 'value')` with `==`, `!=`, `contains`,
   `starts_with`, `=~` or `!~` (regular expressions). `any`, `file ==`,

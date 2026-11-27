@@ -297,7 +297,8 @@ PlayState: PLAY | PAUSE | STOP
 
 Status(state: PlayState, queue_length, song_id, song_uri, elapsed, duration, crossfade)
 
-AlbumSettings(group_tag, use_mbid, unknown, split_by_directory, compilations)  # §1.8, §7.1
+AlbumSettings(group_tag, use_mbid, unknown, split_by_directory, compilations,
+              merge_discs)                                   # §1.8, §7.1
 Config(mode, playlist, queue_length, last_played_hours, uniq_tag, ignore_hated,
        filter_include, filter_exclude, min_song_duration, max_song_duration,
        queue_length_song, queue_length_song_min,
@@ -762,6 +763,7 @@ use_mbid = true
 unknown = false
 split_by_directory = false # an album is one folder (with discs): copies elsewhere are left out (§7.1)
 compilations = false       # songs without AlbumArtist, one folder, many artists: one album (§7.1)
+merge_discs = false        # "Album (CD 2)" and "Album - Disc 1" are discs of "Album" (§7.1)
 ```
 
 `parse_config(raw: Mapping) -> Settings` is pure and raises `ConfigError`.
@@ -1085,6 +1087,39 @@ same suite, and `nix flake check` adds the VM test of §5.7.
     cached with the index). A song that is not in the index falls back to
     its own key. On a library of 58,000 songs, 300 folders are detected,
     and one-song albums drop from 4,000 to 2,500.
+
+11. **Disc numbers in Album tags** (`[albums] merge_discs`, off by
+    default). Discs are often tagged as albums of their own, such as
+    "Album (CD 1)", "Album [Disc 2]" or "Album - Disc 3", so each disc
+    has its own key and album mode adds one disc. With the option on, the
+    album key uses the Album tag without its disc number
+    (`tags.split_disc`). Only CD, Disc and Disk followed by a number
+    count; volumes and parts name separate releases. The rules, tried in
+    order:
+    1. a bracket holding only the disc goes: "Album (CD 2)", "Album [Disc
+       2 of 3]";
+    2. a disc at the end, or just before a final bracket, goes with a
+       separator before it: "Album - Disc 2", "Album -Disc2-", "Album Vol.
+       3 CD2 (Mixed by X)" (giving "Album Vol. 3 (Mixed by X)");
+    3. a bracket that starts with the disc goes: "Album (CD1 - Subtitle)";
+    4. a disc after a separator inside a bracket goes up to the bracket's
+       end: "Album (Deluxe Edition: Disc 2)" (giving "Album (Deluxe
+       Edition)");
+    5. a disc after a space goes with the rest of the tag, which is the
+       disc's subtitle: "Album CD1 Subtitle", "Album Disc 01／Side A".
+
+    A rule applies only if what it removes and what is left have matching
+    brackets and something is left, so a catalogue number such as "[ABC
+    CD8]", "(single CD1)" or a tag "CD 1" stays as it is. The disc number
+    found also orders an album's songs, ahead of the Disc tag, so discs
+    tagged this way play in order even in one folder (`tags.disc_number`,
+    used regardless of the option), and it tells disc folders apart in the
+    test of item 9. Compilations (item 10) group by the Album tag without
+    its disc number. The key depends only on a song's tags, so nothing else
+    changes. On a library of 58,000 songs, 330 Album tags carry a disc
+    number and 129 albums gain discs; singles released as "CD 1" and "CD
+    2" become one album, which seems right. `split_disc` is cached per
+    Album tag.
 
 ### 7.2 Kept as in myMPD, on purpose
 

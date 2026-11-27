@@ -14,9 +14,11 @@ from mpd_jukebox.tags import (
     album_key,
     basename,
     canonical_tag,
+    disc_number,
     merge_tags,
     normalize,
     number,
+    split_disc,
     tag_value,
 )
 
@@ -482,6 +484,94 @@ class CompilationTestCase(unittest.TestCase):
             song('C/Mix/02.mp3', artist='Y', track='2'),
         ]
         self.assertEqual(dict(compilation_keys(songs, self.COMP)), {})
+
+
+class MergeDiscsTestCase(unittest.TestCase):
+    MERGE = AlbumSettings(merge_discs=True)
+
+    def test_split_disc(self):
+        cases = {
+            'Album - Disc 2': ('Album', 2),
+            'Album -Disc2-': ('Album', 2),
+            'Album [Disc 3]': ('Album', 3),
+            'Album (CD 2)': ('Album', 2),
+            'Album (cd2)': ('Album', 2),
+            'Album (Disk 2 of 3)': ('Album', 2),
+            'Album CD2': ('Album', 2),
+            'Album: CD 2': ('Album', 2),
+            'Album DISC 02': ('Album', 2),
+            'Album (Deluxe)(Disc 1)': ('Album (Deluxe)', 1),
+            'Album Vol. 3 CD2 (Mixed by X)': ('Album Vol. 3 (Mixed by X)', 2),
+            'Album CD1 Subtitle (Mixed by X)': ('Album', 1),
+            'Album CD2 Bonus Disc': ('Album', 2),
+            'Album Disc 01／Side A': ('Album', 1),
+            'Album : CD 1 Subtitle': ('Album', 1),
+            'Album (CD1 - Subtitle)': ('Album', 1),
+            'Album (Deluxe Edition: Disc 2)': ('Album (Deluxe Edition)', 2),
+            # Left alone.
+            'Album': ('Album', 0),
+            'Album Vol. 2': ('Album Vol. 2', 0),
+            'Album Part 2': ('Album Part 2', 0),
+            'Album (single CD1)': ('Album (single CD1)', 0),
+            'Album [ABC CD8]': ('Album [ABC CD8]', 0),
+            'Album [ABCD 19]': ('Album [ABCD 19]', 0),
+            'CD 1': ('CD 1', 0),
+            'Discovery': ('Discovery', 0),
+            'Disco 2000': ('Disco 2000', 0),
+        }
+        for album, expected in cases.items():
+            with self.subTest(album):
+                self.assertEqual(split_disc(album), expected)
+
+    def test_disc_number(self):
+        self.assertEqual(disc_number(song('a', album='A (CD 2)').tags), 2)
+        self.assertEqual(
+            disc_number(song('a', album='A (CD 2)', disc='1').tags), 2
+        )
+        self.assertEqual(disc_number(song('a', album='A', disc='3').tags), 3)
+        self.assertEqual(disc_number(song('a', disc='3').tags), 3)
+        self.assertEqual(disc_number(song('a').tags), 0)
+
+    def test_album_key(self):
+        one = song('a', artist='R', album='A (CD 1)').tags
+        two = song('b', artist='R', album='A - Disc 2').tags
+        self.assertNotEqual(
+            album_key(one, AlbumSettings()), album_key(two, AlbumSettings())
+        )
+        self.assertEqual(
+            album_key(one, self.MERGE), album_key(two, self.MERGE)
+        )
+        self.assertEqual(
+            album_key(one, self.MERGE),
+            album_key(song('c', artist='R', album='A').tags, AlbumSettings()),
+        )
+
+    def test_discs_in_one_folder_play_in_order(self):
+        songs = [
+            song('A/2-01.mp3', artist='R', album='A (CD 2)', track='1'),
+            song('A/1-02.mp3', artist='R', album='A (CD 1)', track='2'),
+            song('A/1-01.mp3', artist='R', album='A (CD 1)', track='1'),
+        ]
+        for settings in (
+            self.MERGE,
+            AlbumSettings(merge_discs=True, split_by_directory=True),
+        ):
+            with self.subTest(settings):
+                (album,) = build_albums(songs, settings).values()
+                self.assertEqual(
+                    album.uris, ('A/1-01.mp3', 'A/1-02.mp3', 'A/2-01.mp3')
+                )
+
+    def test_compilation_on_discs_in_one_folder(self):
+        songs = [
+            song('C/1-01.mp3', artist='X', album='Mix CD1', track='1'),
+            song('C/1-02.mp3', artist='Y', album='Mix CD1', track='2'),
+            song('C/2-01.mp3', artist='Z', album='Mix CD2', track='1'),
+        ]
+        settings = AlbumSettings(compilations=True, merge_discs=True)
+        keys = compilation_keys(songs, settings)
+        self.assertEqual(len(set(keys.values())), 1)
+        self.assertEqual(len(keys), 3)
 
 
 class ModelTestCase(unittest.TestCase):

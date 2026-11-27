@@ -47,7 +47,14 @@ _ADVANCED_KEYS = frozenset(
     }
 )
 _ALBUM_KEYS = frozenset(
-    {'group_tag', 'use_mbid', 'unknown', 'split_by_directory', 'compilations'}
+    {
+        'group_tag',
+        'use_mbid',
+        'unknown',
+        'split_by_directory',
+        'compilations',
+        'merge_discs',
+    }
 )
 
 
@@ -191,6 +198,7 @@ def parse_config(raw: Mapping[str, Any]) -> Settings:
             unknown=_bool(album, 'unknown', False, al),
             split_by_directory=_bool(album, 'split_by_directory', False, al),
             compilations=_bool(album, 'compilations', False, al),
+            merge_discs=_bool(album, 'merge_discs', False, al),
         ),
     )
 
@@ -237,6 +245,7 @@ def fingerprint(config: Config) -> str:
         'album_unknown': config.albums.unknown,
         'album_split_by_directory': config.albums.split_by_directory,
         'album_compilations': config.albums.compilations,
+        'album_merge_discs': config.albums.merge_discs,
     }
     encoded = json.dumps(fields, sort_keys=True).encode()
     return hashlib.sha256(encoded).hexdigest()

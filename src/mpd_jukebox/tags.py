@@ -1,6 +1,8 @@
 """Tag helpers: names, values, normalisation and album keys (§1.8)."""
 
+import functools
 import hashlib
+import re
 import unicodedata
 from collections.abc import Iterable, Mapping
 from types import MappingProxyType
@@ -117,6 +119,8 @@ def album_key(tags: Tags, settings: AlbumSettings) -> str | None:
         if not settings.unknown:
             return None
         album = UNKNOWN_ALBUM
+    elif settings.merge_discs:
+        album = split_disc(album)[0]
     key = f'{artist}::{album}'
     if settings.group_tag is not None:
         group = first(tags, settings.group_tag)
@@ -146,3 +150,65 @@ def number(value: str | None) -> int:
         return 0
     head = value.split('/', 1)[0].strip()
     return int(head) if head.isdigit() else 0
+
+
+_DISC = (
+    r'(?<!\w)(?:cd|dis[ck])\s*\.?\s*(\d{1,2})(?:\s*(?:of|/)\s*\d{1,2})?(?!\w)'
+)
+_SEP = r'[-–:,／]'
+# Tried in order; the first that matches wins.
+_DISC_PATTERNS = (
+    # "Album (CD 2)", "Album [Disc 3 of 4]": the brackets hold nothing else.
+    re.compile(rf'\s*[(\[]\s*{_DISC}\s*[)\]]', re.IGNORECASE),
+    # "Album - Disc 2", "Album -Disc1-", "Album CD2 (Mixed by X)": at the
+    # end, or just before a final bracket, which is kept.
+    re.compile(
+        rf'(?:\s*{_SEP})?\s*{_DISC}\s*-?(?=\s*(?:$|[(\[]))', re.IGNORECASE
+    ),
+    # "Album (CD1 - Subtitle)": a bracket that starts with the disc goes.
+    re.compile(rf'\s*[(\[]\s*{_DISC}[^)\]]*[)\]]', re.IGNORECASE),
+    # "Album (Edition: Disc 2)": the disc and its subtitle, up to the
+    # closing bracket.
+    re.compile(rf'\s*{_SEP}\s*{_DISC}[^)\]]*(?=[)\]])', re.IGNORECASE),
+    # "Album CD1 Subtitle", "Album Disc 01／Side A": the disc and its
+    # subtitle, to the end.
+    re.compile(rf'(?:\s*{_SEP})?\s+{_DISC}.*$', re.IGNORECASE),
+)
+
+
+_BRACKET_SPACE = re.compile(r'(?<=[(\[])\s+|\s+(?=[)\]])')
+
+
+def _balanced(text: str) -> bool:
+    return text.count('(') == text.count(')') and text.count(
+        '['
+    ) == text.count(']')
+
+
+@functools.lru_cache(maxsize=1 << 16)  # pure; a library has few Album tags
+def split_disc(album: str) -> tuple[str, int]:
+    """An Album tag without its disc number (and the disc's subtitle), and
+    the disc number, 0 for none (§7.1). For example `("Album", 2)` for
+    "Album (CD 2)", "Album [Disc 2 of 3]", "Album - Disc 2", "Album CD2
+    Bonus Disc" or "Album (CD2 - Live)", and `("Album (Mixed by X)", 2)`
+    for "Album CD2 (Mixed by X)". Only CD, Disc and Disk count: volumes
+    and parts are separate albums. A disc inside a bracket that does not
+    start with it or follow a separator ("[ABC CD8]", a catalogue number,
+    or "(single CD1)") is left alone, and so is a tag that is nothing but
+    a disc number."""
+    for pattern in _DISC_PATTERNS:
+        for match in pattern.finditer(album):
+            removed = album[match.start() : match.end()]
+            rest = album[: match.start()] + ' ' + album[match.end() :]
+            base = _BRACKET_SPACE.sub('', ' '.join(rest.split()))
+            if base and _balanced(removed) and _balanced(base):
+                return base, int(match.group(1))
+    return album, 0
+
+
+def disc_number(tags: Tags) -> int:
+    """A song's disc: from a disc number in its Album tag (`split_disc`),
+    which is explicit, else from its Disc tag; 0 if neither has one."""
+    album = first(tags, 'album')
+    disc = split_disc(album)[1] if album is not None else 0
+    return disc or number(first(tags, 'disc'))

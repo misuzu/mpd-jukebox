@@ -10,17 +10,19 @@ from .model import Album, AlbumSettings, Song
 from .tags import (
     MBID_LENGTH,
     album_key,
+    disc_number,
     first,
     joined,
     merge_tags,
     normalize,
     number,
+    split_disc,
 )
 
 
 def _order(song: Song) -> tuple[int, int, str]:
     return (
-        number(first(song.tags, 'disc')),
+        disc_number(song.tags),
         number(first(song.tags, 'track')),
         song.uri,
     )
@@ -30,7 +32,7 @@ def _order_by_directory(song: Song) -> tuple[int, str, int, str]:
     # The CUE sheet, not its folder, so that `CD 1.cue` and `CD 2.cue` in
     # one folder do not interleave.
     return (
-        number(first(song.tags, 'disc')),
+        disc_number(song.tags),
         posixpath.dirname(song.uri),
         number(first(song.tags, 'track')),
         song.uri,
@@ -55,7 +57,7 @@ def _titles(songs: Iterable[Song]) -> set[str]:
 
 
 def _discs(songs: Iterable[Song]) -> set[int]:
-    return {number(first(s.tags, 'disc')) for s in songs}
+    return {disc_number(s.tags) for s in songs}
 
 
 def _distinct(a: list[Song], b: list[Song]) -> bool:
@@ -149,12 +151,13 @@ def compilation_keys(
     Without AlbumArtist, a song's album key comes from its Artist, so a
     compilation tagged only with track artists falls apart into an album
     per artist. Songs without AlbumArtist (and without a MusicBrainz album
-    ID, if those are used) that share a folder (`folder`), an Album tag and
-    the group tag form a compilation if they have at least two different
-    artists and every song has a track number, with no disc and track
-    number twice. They get the album key they would have with AlbumArtist
-    "Various Artists". The track numbers keep out folders of unrelated
-    songs that happen to share an Album tag such as "Single".
+    ID, if those are used) that share a folder (`folder`), an Album tag
+    (without its disc number, with `merge_discs`) and the group tag form a
+    compilation if they have at least two different artists and every song
+    has a track number, with no disc and track number twice. They get the
+    album key they would have with AlbumArtist "Various Artists". The track
+    numbers keep out folders of unrelated songs that happen to share an
+    Album tag such as "Single".
     """
     groups: dict[tuple[str, str, str], list[Song]] = {}
     for song in songs:
@@ -172,13 +175,15 @@ def compilation_keys(
             if settings.group_tag is not None
             else ''
         )
+        if settings.merge_discs:
+            album = split_disc(album)[0]
         groups.setdefault((folder(song.uri), album, group), []).append(song)
     result: dict[str, str] = {}
     for members in groups.values():
         if len({joined(s.tags, 'artist') for s in members}) < 2:
             continue
         numbers = [
-            (number(first(s.tags, 'disc')), number(first(s.tags, 'track')))
+            (disc_number(s.tags), number(first(s.tags, 'track')))
             for s in members
         ]
         if not all(track for _, track in numbers):

@@ -84,6 +84,7 @@ class AlbumSettings:
     unknown: bool = False
     split_by_directory: bool = False
     compilations: bool = False
+    merge_discs: bool = False
 
 
 @dataclass(frozen=True, slots=True)

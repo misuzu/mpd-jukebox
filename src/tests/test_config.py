@@ -51,6 +51,7 @@ class ParseConfigTestCase(unittest.TestCase):
                     'unknown': True,
                     'split_by_directory': True,
                     'compilations': True,
+                    'merge_discs': True,
                 },
             }
         )
@@ -61,6 +62,7 @@ class ParseConfigTestCase(unittest.TestCase):
         self.assertFalse(cfg.albums.use_mbid)
         self.assertTrue(cfg.albums.split_by_directory)
         self.assertTrue(cfg.albums.compilations)
+        self.assertTrue(cfg.albums.merge_discs)
         self.assertTrue(cfg.write_stickers)
         self.assertIsInstance(settings.include, Filter)
         self.assertIsInstance(settings.exclude, Filter)
@@ -87,6 +89,7 @@ class ParseConfigTestCase(unittest.TestCase):
             {'albums': {'group_tag': 'nope'}},
             {'albums': {'split_by_directory': 'yes'}},
             {'albums': {'compilations': 1}},
+            {'albums': {'merge_discs': 'no'}},
             {'state_file': 5},
         ]
         for raw in cases:
@@ -109,6 +112,8 @@ class ParseConfigTestCase(unittest.TestCase):
         self.assertNotEqual(fingerprint(a), fingerprint(d))
         e = parse_config({'albums': {'compilations': True}}).config
         self.assertNotEqual(fingerprint(a), fingerprint(e))
+        f = parse_config({'albums': {'merge_discs': True}}).config
+        self.assertNotEqual(fingerprint(a), fingerprint(f))
 
 
 class ReadConfigFileTestCase(unittest.TestCase):
