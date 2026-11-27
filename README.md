@@ -19,6 +19,16 @@ client: run it next to MPD and the music never stops.
 
 How it works, and how it differs from myMPD, is in [DESIGN.md](./DESIGN.md).
 
+## Install
+
+With Python 3.11 or newer:
+
+```sh
+pip install "git+https://github.com/misuzu/mpd-jukebox.git@v0.1#subdirectory=src"
+```
+
+On NixOS, use the [module](#nixos-module) instead.
+
 ## Quick start
 
 Turn on MPD's consume mode first. The jukebox only tops the queue up to a
