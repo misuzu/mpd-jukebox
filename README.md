@@ -154,7 +154,7 @@ discards the songs picked in advance at the next start, as myMPD does.
 
 ```nix
 # in your flake
-inputs.mpd-jukebox.url = "github:misuzu/mpd-jukebox";
+inputs.mpd-jukebox.url = "github:misuzu/mpd-jukebox/v0.1";
 
 # in your NixOS configuration
 imports = [

@@ -10,6 +10,12 @@ Tags = Mapping[str, tuple[str, ...]]
 EMPTY_TAGS: Tags = MappingProxyType({})
 
 
+def _no_tags() -> Tags:
+    # A default_factory, not a plain default: Python 3.11's dataclasses
+    # reject unhashable defaults such as a MappingProxyType.
+    return EMPTY_TAGS
+
+
 def freeze_tags(tags: Mapping[str, tuple[str, ...]]) -> Tags:
     return MappingProxyType(dict(tags))
 
@@ -19,7 +25,7 @@ class Song:
     """A song as reported by MPD. Tag names are lower case."""
 
     uri: str
-    tags: Tags = EMPTY_TAGS
+    tags: Tags = field(default_factory=_no_tags)
     duration: float = 0.0
     prio: int = 0
     last_modified: int = 0
@@ -33,7 +39,7 @@ class Album:
     key: str
     first_uri: str
     uris: tuple[str, ...]
-    tags: Tags = EMPTY_TAGS
+    tags: Tags = field(default_factory=_no_tags)
     last_modified: int = 0
     added: int = 0
 

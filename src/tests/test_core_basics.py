@@ -167,3 +167,11 @@ class BuildAlbumsTestCase(unittest.TestCase):
         ]
         (album,) = build_albums(songs, AlbumSettings()).values()
         self.assertEqual((album.last_modified, album.added), (7, 3))
+
+
+class ModelTestCase(unittest.TestCase):
+    def test_default_tags_are_empty(self):
+        from mpd_jukebox.model import EMPTY_TAGS, Album, Song
+
+        self.assertIs(Song('a.mp3').tags, EMPTY_TAGS)
+        self.assertIs(Album('k', 'a.mp3', ('a.mp3',)).tags, EMPTY_TAGS)
