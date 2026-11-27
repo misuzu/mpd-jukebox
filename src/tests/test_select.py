@@ -138,6 +138,13 @@ class ConstraintTestCase(unittest.TestCase):
         )
         self.assertEqual(result.keys, {album_key(s.tags, AlbumSettings()), ''})
 
+    def test_uniq_context_albums_from_index(self):
+        s = song('a', artist='A', album='X')
+        result = uniq_context(
+            Mode.ALBUM, 'artist', [s, song('b')], AlbumSettings(), {'a': 'k'}
+        )
+        self.assertEqual(result.keys, {'k', ''})
+
 
 class SelectTestCase(unittest.TestCase):
     def candidates(self, n):

@@ -83,6 +83,7 @@ class AlbumSettings:
     use_mbid: bool = True
     unknown: bool = False
     split_by_directory: bool = False
+    compilations: bool = False
 
 
 @dataclass(frozen=True, slots=True)

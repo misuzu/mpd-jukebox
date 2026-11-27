@@ -297,7 +297,7 @@ PlayState: PLAY | PAUSE | STOP
 
 Status(state: PlayState, queue_length, song_id, song_uri, elapsed, duration, crossfade)
 
-AlbumSettings(group_tag, use_mbid, unknown, split_by_directory)  # §1.8, §7.1
+AlbumSettings(group_tag, use_mbid, unknown, split_by_directory, compilations)  # §1.8, §7.1
 Config(mode, playlist, queue_length, last_played_hours, uniq_tag, ignore_hated,
        filter_include, filter_exclude, min_song_duration, max_song_duration,
        queue_length_song, queue_length_song_min,
@@ -349,7 +349,9 @@ Log(level, message)
 `StartRefill` needs the uniqueness context (§1.6), which includes the songs in
 the MPD queue. The core does not hold the MPD queue's contents, so the shell
 fetches them and builds `queue_list` with the pure function
-`uniq_context(mode, uniq_tag, songs, album_settings)`. It then calls
+`uniq_context(mode, uniq_tag, songs, album_settings, album_of)`, where
+`album_of` maps URIs to the album index's keys when compilations are
+detected (§7.1). It then calls
 `select_init`. The core decides *when* to refill and *how many* entries to
 pick. The shell gathers the inputs and runs the fold.
 
@@ -759,6 +761,7 @@ group_tag = ""             # e.g. "Date"
 use_mbid = true
 unknown = false
 split_by_directory = false # an album is one folder (with discs): copies elsewhere are left out (§7.1)
+compilations = false       # songs without AlbumArtist, one folder, many artists: one album (§7.1)
 ```
 
 `parse_config(raw: Mapping) -> Settings` is pure and raises `ConfigError`.
@@ -1056,6 +1059,32 @@ same suite, and `nix flake check` adds the VM test of §5.7.
    tags splits into its discs, the largest kept; a stray song that shares
    no title with the album (another song tagged with its album name) in a
    sibling folder joins it as a disc.
+
+10. **Untagged compilations** (`[albums] compilations`, off by default).
+    Without AlbumArtist, a song's album key comes from its Artist (§1.8),
+    so a compilation tagged only with track artists falls apart into an
+    album per artist, mostly of one song, and album mode adds one song.
+    With the option on (`albums.compilation_keys`), songs without
+    AlbumArtist (and without a usable MusicBrainz album ID, if `use_mbid`)
+    that share a folder (CUE-aware, as in item 9), an Album tag and the
+    `group_tag` value form a compilation if:
+    - they have at least two different artists, and
+    - every song has a track number and no disc and track number pair
+      repeats.
+
+    The second condition keeps out folders of unrelated songs that share a
+    placeholder Album tag such as "Single" or "White label". A compilation's
+    songs get the key they would have with AlbumArtist `Various Artists`,
+    so a compilation on several discs, or copies of it in other folders,
+    share one key, and `split_by_directory` treats them like any album.
+    The songs' tags are not changed.
+
+    Album keys then depend on a song's folder and neighbours, not only on
+    its tags, so in the uniqueness context the songs of MPD's queue and
+    history get their album's key from the index by URI (`album_of`,
+    cached with the index). A song that is not in the index falls back to
+    its own key. On a library of 58,000 songs, 300 folders are detected,
+    and one-song albums drop from 4,000 to 2,500.
 
 ### 7.2 Kept as in myMPD, on purpose
 

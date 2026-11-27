@@ -125,6 +125,7 @@ group_tag = ""              # also split albums by this tag, e.g. "Date"
 use_mbid = true             # identify albums by MusicBrainz album ID
 unknown = false             # songs without an Album tag form "Unknown Album"
 split_by_directory = false  # an album is one folder; copies elsewhere are left out
+compilations = false        # no AlbumArtist, one folder, many artists: one album
 ```
 
 ```sh
@@ -150,6 +151,12 @@ discards the songs picked in advance at the next start, as myMPD does.
   holding an album's songs, the one with the most is used, and stray
   copies and other editions are left out. Folders count as parts of one
   album when they share no song title (DESIGN.md §7.1).
+  Songs without an AlbumArtist tag are grouped by Artist, so a
+  compilation tagged only with track artists becomes an album per artist,
+  and album mode adds a single song. With `compilations`, such songs in
+  one folder with the same Album tag, several artists and distinct track
+  numbers form one album, as if tagged AlbumArtist "Various Artists".
+  Tagging AlbumArtist is still the better fix where you can.
 - **Filters** use myMPD's subset of MPD's filter syntax: clauses joined
   with `AND`, each `(TAG OP 'value')` with `==`, `!=`, `contains`,
   `starts_with`, `=~` or `!~` (regular expressions). `any`, `file ==`,

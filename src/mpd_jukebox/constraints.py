@@ -175,17 +175,21 @@ def uniq_context(
     uniq_tag: str,
     songs: Iterable[Song],
     albums: AlbumSettings,
+    album_of: Mapping[str, str] | None = None,
 ) -> UniqContext:
     """myMPD's jukebox_get_last_played: one (key, tag value) per song of the
     MPD queue and recent history. With uniq tag `title` the value is
-    empty."""
+    empty. In album mode, `album_of` (the album key of each URI in the
+    album index) takes precedence over the song's own album key, which
+    differs for songs of untagged compilations (§7.1)."""
     keys: set[str] = set()
     values: set[str] = set()
     for song in songs:
         if mode is Mode.SONG:
             keys.add(song.uri)
         else:
-            keys.add(album_key(song.tags, albums) or '')
+            key = album_of.get(song.uri) if album_of is not None else None
+            keys.add(key or album_key(song.tags, albums) or '')
         values.add(
             '' if uniq_tag == 'title' else tag_value(song.tags, uniq_tag, '')
         )

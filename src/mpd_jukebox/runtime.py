@@ -12,7 +12,7 @@ from mpd.base import CommandError, ProtocolError
 from mpd.base import ConnectionError as MpdConnectionError
 
 from . import jukebox as core
-from .albums import build_albums
+from .albums import album_of, build_albums
 from .config import Settings, fingerprint
 from .connection import Connection
 from .constraints import (
@@ -121,6 +121,9 @@ class Refiller:
         self._albums_generation = -1
         self._building: asyncio.Task[Mapping[str, Album]] | None = None
         self._building_generation = -1
+        self._album_of_cache: (
+            tuple[Mapping[str, Album], Mapping[str, str]] | None
+        ) = None
 
     def invalidate(self) -> None:
         """MPD's database (may have) changed: the album index is stale."""
@@ -151,11 +154,18 @@ class Refiller:
             song = await io.song(uri)
             if song is not None:
                 history_songs.append(song)
+        albums = None
+        lookup = None
+        if effect.mode is Mode.ALBUM:
+            albums = await self.album_index(io)
+            if cfg.albums.compilations:
+                lookup = self._album_of(albums)
         uniq = uniq_context(
             effect.mode,
             cfg.uniq_tag,
             queue_songs + tuple(history_songs),
             cfg.albums,
+            lookup,
         )
 
         stickers = await io.stickers('lastPlayed')
@@ -170,10 +180,9 @@ class Refiller:
             hated_uris(likes, cfg.ignore_hated),
         )
         acc = select_init(effect.existing, effect.expected, self.seed(), uniq)
-        if effect.mode is Mode.SONG:
+        if albums is None:
             acc = await self._songs(io, acc, ctx)
         else:
-            albums = await self.album_index(io)
             for album in albums.values():
                 acc = select_step(acc, album_candidate(ctx, album))
 
@@ -185,6 +194,13 @@ class Refiller:
             f'{result.found} of {result.expected} entries',
             now,
         )
+
+    def _album_of(self, albums: Mapping[str, Album]) -> Mapping[str, str]:
+        """The URI-to-album-key map of an index, cached with it."""
+        cached = self._album_of_cache
+        if cached is None or cached[0] is not albums:
+            cached = self._album_of_cache = (albums, album_of(albums))
+        return cached[1]
 
     async def _songs(
         self, io: MpdIO, acc: Reservoir, ctx: SelectContext

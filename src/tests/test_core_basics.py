@@ -1,7 +1,14 @@
 import unittest
 
 from mpd_jukebox import rng
-from mpd_jukebox.albums import album_parts, build_albums, folder
+from mpd_jukebox.albums import (
+    VARIOUS_ARTISTS,
+    album_of,
+    album_parts,
+    build_albums,
+    compilation_keys,
+    folder,
+)
 from mpd_jukebox.model import AlbumSettings, Song
 from mpd_jukebox.tags import (
     album_key,
@@ -14,6 +21,8 @@ from mpd_jukebox.tags import (
 )
 
 from .helpers import song
+
+MBID = '01234567-89ab-cdef-0123-456789abcdef'
 
 
 class RngTestCase(unittest.TestCase):
@@ -386,6 +395,93 @@ class SplitByDirectoryTestCase(unittest.TestCase):
         songs = self.tracks('B/Album/01.mp3', 'A/Album/01.mp3')
         (album,) = build_albums(songs, self.SPLIT).values()
         self.assertEqual(album.uris, ('A/Album/01.mp3',))
+
+
+class CompilationTestCase(unittest.TestCase):
+    COMP = AlbumSettings(compilations=True)
+
+    def track(self, uri: str, artist: str, track: str, **tags: str) -> Song:
+        return song(
+            uri, 200.0, artist=artist, album='Mix', track=track, **tags
+        )
+
+    def test_untagged_compilation_is_one_album(self):
+        songs = [
+            self.track('C/Mix/01.mp3', 'X', '1'),
+            self.track('C/Mix/02.mp3', 'Y feat. Z', '2'),
+            self.track('C/Mix/03.mp3', 'X', '3'),
+        ]
+        keys = compilation_keys(songs, self.COMP)
+        various = song('v', albumartist=VARIOUS_ARTISTS, album='Mix')
+        self.assertEqual(
+            dict(keys),
+            dict.fromkeys(
+                (s.uri for s in songs), album_key(various.tags, self.COMP)
+            ),
+        )
+        merged = build_albums(songs, AlbumSettings())
+        self.assertEqual(len(merged), 2)
+        (album,) = build_albums(songs, self.COMP).values()
+        self.assertEqual(len(album.uris), 3)
+        self.assertEqual(dict(album_of({album.key: album})), dict(keys))
+
+    def test_not_a_compilation(self):
+        cases = {
+            'one artist': [
+                self.track('C/Mix/01.mp3', 'X', '1'),
+                self.track('C/Mix/02.mp3', 'X', '2'),
+            ],
+            'different folders': [
+                self.track('C/Mix/01.mp3', 'X', '1'),
+                self.track('D/Mix/02.mp3', 'Y', '2'),
+            ],
+            'a track number missing': [
+                self.track('C/Mix/01.mp3', 'X', '1'),
+                self.track('C/Mix/02.mp3', 'Y', ''),
+            ],
+            'a track number twice': [
+                self.track('C/Single/01.mp3', 'X', '1'),
+                self.track('C/Single/02.mp3', 'Y', '1'),
+            ],
+            'tagged with AlbumArtist': [
+                self.track('C/Mix/01.mp3', 'X', '1', albumartist='VA'),
+                self.track('C/Mix/02.mp3', 'Y', '2', albumartist='VA'),
+            ],
+            'MusicBrainz album IDs': [
+                self.track('C/Mix/01.mp3', 'X', '1', musicbrainz_albumid=MBID),
+                self.track('C/Mix/02.mp3', 'Y', '2', musicbrainz_albumid=MBID),
+            ],
+        }
+        for name, songs in cases.items():
+            with self.subTest(name):
+                self.assertEqual(dict(compilation_keys(songs, self.COMP)), {})
+
+    def test_discs_and_group_tag(self):
+        songs = [
+            self.track('C/Mix/01.mp3', 'X', '1', disc='1', date='2001'),
+            self.track('C/Mix/02.mp3', 'Y', '1', disc='2', date='2001'),
+            self.track('C/Mix/03.mp3', 'Z', '1', disc='1', date='2002'),
+            self.track('C/Mix/04.mp3', 'W', '2', disc='1', date='2002'),
+        ]
+        settings = AlbumSettings(compilations=True, group_tag='date')
+        keys = compilation_keys(songs, settings)
+        self.assertEqual(len(keys), 4)
+        self.assertEqual(len(set(keys.values())), 2)
+        # Without MusicBrainz IDs in use, an ID does not stop detection.
+        tagged = [
+            self.track('C/Mix/01.mp3', 'X', '1', musicbrainz_albumid=MBID),
+            self.track('C/Mix/02.mp3', 'Y', '2'),
+        ]
+        no_mbid = AlbumSettings(compilations=True, use_mbid=False)
+        self.assertEqual(len(compilation_keys(tagged, no_mbid)), 2)
+        self.assertEqual(len(compilation_keys(tagged, self.COMP)), 0)
+
+    def test_without_artist_or_album(self):
+        songs = [
+            song('C/Mix/01.mp3', album='Mix', track='1'),
+            song('C/Mix/02.mp3', artist='Y', track='2'),
+        ]
+        self.assertEqual(dict(compilation_keys(songs, self.COMP)), {})
 
 
 class ModelTestCase(unittest.TestCase):

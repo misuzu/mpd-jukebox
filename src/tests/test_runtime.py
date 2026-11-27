@@ -534,6 +534,42 @@ class RefillerTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake.commands.count('search'), 3)
         self.assertEqual(len(index), 5)
 
+    async def test_queued_compilation_song_excludes_its_album(self):
+        def mix(uri, artist, n):
+            return track(uri, artist=artist, album='Mix', track=n, title=uri)
+
+        fake = FakeMPD(
+            [
+                mix('C/Mix/1.mp3', 'X', '1'),
+                mix('C/Mix/2.mp3', 'Y', '2'),
+                track('D/Other/1.mp3', artist='Z', album='Other', title='o'),
+            ]
+        )
+        await fake.add('C/Mix/1.mp3')
+        settings = parse_config(
+            {
+                'jukebox': {'mode': 'album', 'uniq_tag': 'Title'},
+                'albums': {'compilations': True},
+            }
+        )
+        refiller = Refiller(settings, _NoHistory(), seed=lambda: 1)
+        io = MpdIO(fake)
+        # The queued song's album is the compilation, found by its URI in
+        # the index; by its own tags it would be X's album "Mix".
+        effect = core.StartRefill(Mode.ALBUM, (), 2, 0)
+        self.assertIsInstance(
+            await refiller.refill(io, effect, 1000), core.RefillFailed
+        )
+        effect = core.StartRefill(Mode.ALBUM, (), 1, 0)
+        result = await refiller.refill(io, effect, 1000)
+        assert isinstance(result, core.RefillDone)
+        (entry,) = result.entries
+        index = await refiller.album_index(io)
+        self.assertEqual(index[entry.key].uris, ('D/Other/1.mp3',))
+        # The URI map is built once per index.
+        await refiller.refill(io, effect, 1000)
+        self.assertIs(refiller._album_of(index), refiller._album_of(index))
+
 
 class _NoHistory:
     async def recent(self, limit):

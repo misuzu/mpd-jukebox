@@ -7,7 +7,15 @@ from collections.abc import Iterable, Mapping
 from types import MappingProxyType
 
 from .model import Album, AlbumSettings, Song
-from .tags import album_key, first, merge_tags, normalize, number
+from .tags import (
+    MBID_LENGTH,
+    album_key,
+    first,
+    joined,
+    merge_tags,
+    normalize,
+    number,
+)
 
 
 def _order(song: Song) -> tuple[int, int, str]:
@@ -130,6 +138,68 @@ def album_parts(
     )
 
 
+VARIOUS_ARTISTS = 'Various Artists'
+
+
+def compilation_keys(
+    songs: Iterable[Song], settings: AlbumSettings
+) -> Mapping[str, str]:
+    """Album keys, by URI, of the songs of untagged compilations (§7.1).
+
+    Without AlbumArtist, a song's album key comes from its Artist, so a
+    compilation tagged only with track artists falls apart into an album
+    per artist. Songs without AlbumArtist (and without a MusicBrainz album
+    ID, if those are used) that share a folder (`folder`), an Album tag and
+    the group tag form a compilation if they have at least two different
+    artists and every song has a track number, with no disc and track
+    number twice. They get the album key they would have with AlbumArtist
+    "Various Artists". The track numbers keep out folders of unrelated
+    songs that happen to share an Album tag such as "Single".
+    """
+    groups: dict[tuple[str, str, str], list[Song]] = {}
+    for song in songs:
+        tags = song.tags
+        album = first(tags, 'album')
+        if joined(tags, 'albumartist') or album is None:
+            continue
+        if not joined(tags, 'artist'):
+            continue
+        mbid = first(tags, 'musicbrainz_albumid')
+        if settings.use_mbid and mbid is not None and len(mbid) == MBID_LENGTH:
+            continue
+        group = (
+            first(tags, settings.group_tag) or ''
+            if settings.group_tag is not None
+            else ''
+        )
+        groups.setdefault((folder(song.uri), album, group), []).append(song)
+    result: dict[str, str] = {}
+    for members in groups.values():
+        if len({joined(s.tags, 'artist') for s in members}) < 2:
+            continue
+        numbers = [
+            (number(first(s.tags, 'disc')), number(first(s.tags, 'track')))
+            for s in members
+        ]
+        if not all(track for _, track in numbers):
+            continue
+        if len(set(numbers)) != len(numbers):
+            continue
+        tags = {**members[0].tags, 'albumartist': (VARIOUS_ARTISTS,)}
+        key = album_key(tags, settings)
+        assert key is not None
+        for song in members:
+            result[song.uri] = key
+    return MappingProxyType(result)
+
+
+def album_of(albums: Mapping[str, Album]) -> Mapping[str, str]:
+    """The album key of each song URI in an album index."""
+    return MappingProxyType(
+        {uri: album.key for album in albums.values() for uri in album.uris}
+    )
+
+
 def build_albums(
     songs: Iterable[Song], settings: AlbumSettings
 ) -> Mapping[str, Album]:
@@ -146,11 +216,20 @@ def build_albums(
     by disc, directory, track and URI, so disc folders without Disc tags
     play in order.
 
+    With `compilations`, songs of untagged compilations get the key of
+    their compilation (`compilation_keys`) instead of their own.
+
     The grouping uses local dicts for speed; nothing outside is mutated.
     """
+    songs = list(songs)
+    compiled = (
+        compilation_keys(songs, settings)
+        if settings.compilations
+        else MappingProxyType({})
+    )
     groups: dict[str, list[Song]] = {}
     for song in songs:
-        key = album_key(song.tags, settings)
+        key = compiled.get(song.uri) or album_key(song.tags, settings)
         if key is not None:
             groups.setdefault(key, []).append(song)
     if settings.split_by_directory:
